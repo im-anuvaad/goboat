@@ -60,6 +60,8 @@ func newMoveSource(lay layout.Layout, st *store.Store, box *secrets.Box, log *sl
 				return err
 			},
 			Stop: func(ctx context.Context) ([]string, error) {
+				// From now on the new server decides what Cloudflare points to.
+				e.PauseAndWait("handing over to the new server")
 				ms.handingOver.Store(true)
 				bk.Quiesce()
 				var running []string
@@ -77,6 +79,7 @@ func newMoveSource(lay layout.Layout, st *store.Store, box *secrets.Box, log *sl
 			},
 			Restart: func(ctx context.Context, running []string) {
 				ms.handingOver.Store(false)
+				e.Resume()
 				for _, name := range running {
 					if err := dep.Start(ctx, name); err != nil {
 						log.Error("move: restarting an app after the move ended", "app", name, "err", err)
@@ -134,14 +137,25 @@ func runIncoming(ctx context.Context, in move.Incoming, lay layout.Layout, st *s
 	if ctx.Err() != nil {
 		return // shutting down; the move continues after the restart
 	}
-	log.Error("the move failed; removing everything received from the old server", "err", err)
-	if c != nil && !errors.Is(err, move.ErrCancelled) {
+	confirmed := errors.Is(err, move.ErrCancelled)
+	if c != nil && !confirmed {
 		fctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		if ferr := c.Failed(fctx, err.Error()); ferr != nil {
+		ferr := c.Failed(fctx, err.Error())
+		cancel()
+		confirmed = ferr == nil
+		if ferr != nil {
 			log.Warn("move: telling the old server", "err", ferr)
 		}
-		cancel()
 	}
+	if errors.Is(err, move.ErrAfterSwitch) && !confirmed {
+		// The old server has stopped its apps and may have retired: this
+		// server may be the only one with them now. Keep everything; goboat
+		// restarts and tries again.
+		log.Error("the move could not be completed or undone; keeping everything and trying again", "err", err)
+		stop()
+		return
+	}
+	log.Error("the move failed; removing everything received from the old server", "err", err)
 	sctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	sup.StopAll(sctx)

@@ -172,10 +172,17 @@ func TestMoveEndToEnd(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	if st := old.src.State(); st.Phase != PhaseDone || old.moved == nil || old.moved.IP != "198.51.100.2" {
+	var moved *Moved
+	for i := 0; i < 100 && moved == nil; i++ { // retiring follows the answer
+		time.Sleep(50 * time.Millisecond)
+		old.mu.Lock()
+		moved = old.moved
+		old.mu.Unlock()
+	}
+	if st := old.src.State(); st.Phase != PhaseDone || moved == nil || moved.IP != "198.51.100.2" {
 		t.Fatalf("old server after the move: %+v moved=%+v", st.Phase, old.moved)
 	}
-	if strings.Join(old.moved.Forward, ",") != "198.51.100.2" || strings.Join(nw.accepted, ",") != "192.0.2.1,2001:db8::1" {
+	if strings.Join(moved.Forward, ",") != "198.51.100.2" || strings.Join(nw.accepted, ",") != "192.0.2.1,2001:db8::1" {
 		t.Fatalf("addresses: old forwards to %v, new accepts %v", old.moved.Forward, nw.accepted)
 	}
 	if strings.Join(nw.prepared, ",") != "web@aaaaaaa/main" || strings.Join(nw.started, ",") != "web" {

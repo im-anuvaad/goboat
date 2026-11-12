@@ -202,6 +202,11 @@ type TargetHooks struct {
 // ErrCancelled means the move was cancelled on the old server.
 var ErrCancelled = errors.New("the move was cancelled on the old server")
 
+// ErrAfterSwitch marks errors after the old server stopped its apps: the
+// new server must not throw anything away unless the old one confirms it
+// serves again (Failed succeeded).
+var ErrAfterSwitch = errors.New("after the switch")
+
 // Run takes over from the old server (docs/architecture.md §10, steps 4-8).
 // It returns nil once the old server has retired; the caller then turns
 // Cloudflare syncs (DNS points here) and backups on.
@@ -264,6 +269,13 @@ func Run(ctx context.Context, c *Client, version string, h TargetHooks, log *slo
 	}
 
 	// 7. Final copy (the apps are stopped there) and start here.
+	if err := takeOver(ctx, c, h, hello, report, log); err != nil {
+		return fmt.Errorf("%w: %w", ErrAfterSwitch, err)
+	}
+	return nil
+}
+
+func takeOver(ctx context.Context, c *Client, h TargetHooks, hello Hello, report func(app, text string), log *slog.Logger) error {
 	start := time.Now()
 	for _, app := range hello.Apps {
 		n, size, err := copyData(ctx, c, h, app.Name, true)
@@ -288,7 +300,27 @@ func Run(ctx context.Context, c *Client, version string, h TargetHooks, log *slo
 		addrs = h.Addrs()
 	}
 	if err := c.Done(ctx, addrs); err != nil {
-		return err
+		// The answer may have been lost on the way although the old
+		// server retired: ask it.
+		for i := 0; i < 10; i++ {
+			time.Sleep(3 * time.Second)
+			h, herr := c.Hello(ctx)
+			switch {
+			case herr != nil:
+				continue
+			case h.Phase == PhaseDone:
+				log.Info("move: the old server retired (its first answer was lost)")
+				return nil
+			case h.Phase != PhaseSwitching:
+				return fmt.Errorf("the old server did not retire (%s): %w", h.Phase, err)
+			}
+			if err = c.Done(ctx, addrs); err == nil {
+				break
+			}
+		}
+		if err != nil {
+			return err
+		}
 	}
 	log.Info("move: the old server retired", "switch_took", time.Since(start).Round(100*time.Millisecond))
 	return nil

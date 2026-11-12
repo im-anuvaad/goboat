@@ -508,8 +508,16 @@ func (s *Source) done(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.Hooks.Moved(m)
+	// Answer first: retiring changes how this server handles connections
+	// (it passes them on), which must not cut this answer off.
 	s.reply(w, r.URL.Path, map[string]bool{"ok": true})
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	go func() {
+		time.Sleep(2 * time.Second)
+		s.Hooks.Moved(m)
+	}()
 }
 
 func (s *Source) failed(w http.ResponseWriter, r *http.Request) {
