@@ -212,9 +212,16 @@ func (f *fakeCF) addCert(host string) string {
 }
 
 type testEdge struct {
-	m     *Manager
-	f     *fakeCF
-	known []string
+	m       *Manager
+	f       *fakeCF
+	knownMu sync.Mutex // background syncs read known
+	known   []string
+}
+
+func (te *testEdge) setKnown(hosts []string) {
+	te.knownMu.Lock()
+	te.known = hosts
+	te.knownMu.Unlock()
 }
 
 func newTestEdge(t *testing.T) *testEdge {
@@ -233,7 +240,11 @@ func newTestEdge(t *testing.T) *testEdge {
 	te := &testEdge{f: f}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	m, err := NewManager(ctx, Config{Listen: "127.0.0.1:0", AOP: true, DataRoot: dir, CloudflareBase: srv.URL,
-		KnownHosts: func(context.Context) ([]string, error) { return te.known, nil }}, st, box, log)
+		KnownHosts: func(context.Context) ([]string, error) {
+			te.knownMu.Lock()
+			defer te.knownMu.Unlock()
+			return append([]string(nil), te.known...), nil
+		}}, st, box, log)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,7 +259,7 @@ func newTestEdge(t *testing.T) *testEdge {
 // serve sets the routed (and configured) hostnames and syncs.
 func (te *testEdge) serve(t *testing.T, hosts ...string) {
 	t.Helper()
-	te.known = hosts
+	te.setKnown(hosts)
 	var rs []Route
 	for i, h := range hosts {
 		rs = append(rs, Route{Host: h, App: fmt.Sprintf("app%d", i), Port: 20001 + i})
@@ -266,12 +277,14 @@ func (te *testEdge) sync(t *testing.T) error {
 func (te *testEdge) remove(t *testing.T, host string) {
 	t.Helper()
 	var keep []string
+	te.knownMu.Lock()
 	for _, h := range te.known {
 		if h != host {
 			keep = append(keep, h)
 		}
 	}
-	te.known = keep
+	te.knownMu.Unlock()
+	te.setKnown(keep)
 	var rs []Route
 	for i, h := range keep {
 		rs = append(rs, Route{Host: h, App: fmt.Sprintf("app%d", i), Port: 20001 + i})
