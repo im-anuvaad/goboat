@@ -224,9 +224,28 @@ func (c *Client) UpsertProxied(ctx context.Context, zoneID, name, typ, content s
 
 // OriginCert is a Cloudflare Origin CA certificate.
 type OriginCert struct {
-	ID          string `json:"id"`
-	Certificate string `json:"certificate"`
-	ExpiresOn   string `json:"expires_on"`
+	ID          string   `json:"id"`
+	Certificate string   `json:"certificate"`
+	ExpiresOn   string   `json:"expires_on"`
+	Hostnames   []string `json:"hostnames"`
+}
+
+// ListOriginCerts lists the zone's Origin CA certificates that are not
+// revoked (Cloudflare leaves revoked ones out).
+func (c *Client) ListOriginCerts(ctx context.Context, zoneID string) ([]OriginCert, error) {
+	var all []OriginCert
+	for page := 1; page <= 20; page++ {
+		var r []OriginCert
+		q := url.Values{"zone_id": {zoneID}, "per_page": {"100"}, "page": {fmt.Sprint(page)}}
+		if err := c.do(ctx, http.MethodGet, "/certificates?"+q.Encode(), "SSL and Certificates: Read", nil, &r); err != nil {
+			return nil, err
+		}
+		all = append(all, r...)
+		if len(r) < 100 {
+			break
+		}
+	}
+	return all, nil
 }
 
 // CreateOriginCert signs csrPEM (ECDSA) for hostnames.

@@ -117,6 +117,19 @@ func serve(log *slog.Logger) error {
 
 	appSvc := apps.New(st, box, dep, sup, edgeMgr, edgeMgr.DashboardHost, log)
 	appSvc.SetBackups(bk)
+	// Cleanup never touches a configured domain, even of an app that fails
+	// to load.
+	edgeMgr.SetKnownHosts(func(ctx context.Context) ([]string, error) {
+		list, err := appSvc.List(ctx)
+		if err != nil {
+			return nil, err
+		}
+		hosts := []string{edgeMgr.DashboardHost()}
+		for _, a := range list {
+			hosts = append(hosts, a.Domain)
+		}
+		return hosts, nil
+	})
 	if err := appSvc.Load(ctx); err != nil {
 		return err
 	}
