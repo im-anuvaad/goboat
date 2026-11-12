@@ -23,6 +23,33 @@ const (
 	DefaultHealthPath = "/"
 )
 
+// The limits the dashboard offers (docs/architecture.md §6.1). The process
+// and open-files limits are fixed.
+var (
+	MemoryChoices = []int64{128 << 20, 256 << 20, 512 << 20, 1 << 30}
+	CPUChoices    = []float64{0.5, 1, 2}
+)
+
+// MemoryChoice reports whether n is one of MemoryChoices.
+func MemoryChoice(n int64) bool {
+	for _, c := range MemoryChoices {
+		if c == n {
+			return true
+		}
+	}
+	return false
+}
+
+// CPUChoice reports whether n is one of CPUChoices.
+func CPUChoice(n float64) bool {
+	for _, c := range CPUChoices {
+		if c == n {
+			return true
+		}
+	}
+	return false
+}
+
 // Limits are the per-app runtime resource limits.
 type Limits struct {
 	MemoryMax int64   // bytes (memory.max); Go apps get GOMEMLIMIT at 90% of it

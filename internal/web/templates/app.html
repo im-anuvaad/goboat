@@ -16,7 +16,9 @@
     </div>
   </div>
   {{if .Pending}}<p class="info">Deployment <a href="/deployments/{{.Pending}}">#{{.Pending}}</a> is in progress.</p>{{end}}
-  {{if .NeedsRestart}}<p class="warn">Settings or env vars changed since the app started. Restart it to apply them.</p>{{end}}
+  {{if .NeedsRestart}}<div class="warn row"><span>Settings or env vars changed since the app started: it still runs with the old ones.</span>
+    <form method="post" action="/apps/{{.Name}}/restart" class="inline">{{template "csrf" $csrf}}<button class="primary">Restart to apply</button></form></div>{{end}}
+  {{if not .Domain}}<p class="error">This app has no domain, so it can't be reached. Set one under Settings below.</p>{{end}}
   {{if eq .Status.State "crashed"}}<p class="error">Crashed and not being restarted: {{.Status.LastError}}</p>{{end}}
   <dl class="facts">
     <dt>Domain</dt><dd>{{if .Domain}}<a href="https://{{.Domain}}/" target="_blank" rel="noopener">{{.Domain}}</a>{{else}}-{{end}}
@@ -132,20 +134,20 @@
   </form>
 </section>
 
-<section class="card">
+<section class="card" id="settings">
   <h2>Settings</h2>
   {{with $.Data.Edit}}
   <form method="post" action="/apps/{{$.Data.App.Name}}/settings" class="grid">
     {{template "csrf" $csrf}}
     <label class="wide">GitHub repository <input name="repo" value="{{.Repo}}" required data-branches="settings-branches"><small>Must keep the name {{$.Data.App.Name}} (the app is named after it)</small></label>
     <label class="wide">Branch <input name="branch" value="{{.Branch}}" required list="settings-branches" autocomplete="off"><datalist id="settings-branches"></datalist><small>Deploys build from this branch; a change applies on the next deploy</small></label>
-    <label class="wide">Domain <input name="domain" value="{{.Domain}}" placeholder="(none)"></label>
+    <label class="wide">Domain <input name="domain" value="{{.Domain}}" placeholder="blog.example.com" required><small>Can be changed (it is re-routed at once), not removed</small></label>
     <fieldset class="wide">
-      <legend>Limits</legend>
-      <label>Memory <input name="memory" value="{{.Memory}}" size="6"></label>
-      <label>CPU cores <input name="cpu" value="{{.CPU}}" size="4"></label>
-      <label>Processes <input name="pids" value="{{.Pids}}" size="5"></label>
+      <legend>Memory and CPU</legend>
+      <label>Memory <select name="memory">{{range $.Data.MemChoices}}<option value="{{.Value}}" {{if .Selected}}selected{{end}}>{{.Label}}</option>{{end}}</select></label>
+      <label>CPU <select name="cpu">{{range $.Data.CPUChoices}}<option value="{{.Value}}" {{if .Selected}}selected{{end}}>{{.Label}}</option>{{end}}</select></label>
     </fieldset>
+    <p class="wide muted">{{with $.Data.Budget}}{{if .RAM}}All apps together may use {{bytes .Total}} of the server's {{bytes .RAM}} of memory ({{printf "%.0f" .Percent}}%); the other apps {{bytes .Others}}.{{end}}{{end}} New limits apply when the app restarts.</p>
     <div class="wide buttons"><button>Save settings</button></div>
   </form>
   {{end}}

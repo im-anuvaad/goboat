@@ -10,7 +10,7 @@
     <label class="wide">Branch <input name="branch" value="{{.Branch}}" placeholder="the repository's default branch" list="new-branches" autocomplete="off"><datalist id="new-branches"></datalist>
       <small>Deploys build the commits of this branch. Leave it empty for the default branch.</small></label>
     {{with $.Data.Repos}}<datalist id="repos">{{range .}}<option value="https://github.com/{{.FullName}}">{{end}}</datalist>{{end}}
-    <label class="wide">Domain <input name="domain" value="{{.Domain}}" placeholder="blog.example.com"><small>DNS record and certificate are created in Cloudflare</small></label>
+    <label class="wide">Domain <input name="domain" value="{{.Domain}}" placeholder="blog.example.com" required><small>Required: the app is served on it. goboat creates its DNS record and certificate in Cloudflare. It can be changed later, not removed.</small></label>
     {{if $.Data.BucketSet}}
     <label class="wide">Start with data from
       <select name="restore_from">
@@ -22,11 +22,11 @@
     </label>
     {{end}}
     <fieldset class="wide">
-      <legend>Limits</legend>
-      <label>Memory <input name="memory" value="{{.Memory}}" size="6"></label>
-      <label>CPU cores <input name="cpu" value="{{.CPU}}" size="4"></label>
-      <label>Processes <input name="pids" value="{{.Pids}}" size="5"></label>
+      <legend>Memory and CPU for the app</legend>
+      <label>Memory <select name="memory">{{range $.Data.MemChoices}}<option value="{{.Value}}" {{if .Selected}}selected{{end}}>{{.Label}}</option>{{end}}</select></label>
+      <label>CPU <select name="cpu">{{range $.Data.CPUChoices}}<option value="{{.Value}}" {{if .Selected}}selected{{end}}>{{.Label}}</option>{{end}}</select></label>
     </fieldset>
+    <p class="wide muted">{{with $.Data.Budget}}{{if .RAM}}The apps on this server may use {{bytes .Total}} of its {{bytes .RAM}} of memory together ({{printf "%.0f" .Percent}}%). Keep the total under about 75%: goboat, the system and builds need the rest.{{end}}{{end}} Limits are set only here, never in <code>goboat.toml</code>, and can be changed later in the app's Settings.</p>
     <div class="wide buttons"><button class="primary">Create app</button> <a class="button" href="/">Cancel</a></div>
   </form>
   {{end}}

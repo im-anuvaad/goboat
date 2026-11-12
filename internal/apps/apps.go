@@ -56,9 +56,9 @@ type App struct {
 // fields mean "default" on create; edits send every field. The name is
 // never entered: it is derived from the repository name.
 type Input struct {
-	Repo, Branch      string
-	Domain            string
-	Memory, CPU, Pids string
+	Repo, Branch string
+	Domain       string
+	Memory, CPU  string // one of app.MemoryChoices / app.CPUChoices
 	// RestoreFrom (create only) is a bucket folder whose newest backup is
 	// restored into the new app ("" = start empty, AutoFolder = the folder
 	// named like the app, if there is one).
@@ -248,7 +248,12 @@ func (s *Service) validate(ctx context.Context, in Input, existing *App) (App, e
 		a.Branch = branch
 	}
 	a.Domain = strings.ToLower(strings.TrimSpace(in.Domain))
-	if a.Domain != "" {
+	switch {
+	case a.Domain == "" && existing != nil && existing.Domain != "":
+		errs = append(errs, fmt.Errorf("the domain can be changed but not removed: without one the app can't be reached (it is %s now)", existing.Domain))
+	case a.Domain == "":
+		errs = append(errs, errors.New("the domain is missing: enter the domain the app will be served on, e.g. blog.example.com"))
+	default:
 		if err := edge.ValidHostname(a.Domain); err != nil {
 			errs = append(errs, err)
 		} else if a.Domain == s.dashboardHost() {
@@ -259,26 +264,36 @@ func (s *Service) validate(ctx context.Context, in Input, existing *App) (App, e
 			}
 		}
 	}
-	parse := func(field, v, def string, f func(string) error) {
-		if strings.TrimSpace(v) == "" {
-			v = def
+	// Limits come only from the dashboard, from fixed choices (docs/
+	// architecture.md §6.1, D23). An existing app keeps a value set before
+	// the choices existed until it is changed.
+	if v := strings.TrimSpace(in.Memory); v == "" {
+		a.Limits.MemoryMax = app.DefaultMemoryMax
+		if existing != nil {
+			a.Limits.MemoryMax = existing.Limits.MemoryMax
 		}
-		if err := f(strings.TrimSpace(v)); err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", field, err))
-		}
+	} else if n, err := app.ParseBytes(v); err != nil {
+		errs = append(errs, fmt.Errorf("memory: %w", err))
+	} else if !app.MemoryChoice(n) && (existing == nil || n != existing.Limits.MemoryMax) {
+		errs = append(errs, fmt.Errorf("memory: choose 128 MB, 256 MB, 512 MB or 1 GB (got %s)", v))
+	} else {
+		a.Limits.MemoryMax = n
 	}
-	parse("memory limit", in.Memory, "256M", func(v string) (err error) {
-		a.Limits.MemoryMax, err = app.ParseBytes(v)
-		return
-	})
-	parse("CPU limit", in.CPU, "1", func(v string) (err error) {
-		a.Limits.CPUMax, err = strconv.ParseFloat(v, 64)
-		return
-	})
-	parse("process limit", in.Pids, strconv.Itoa(app.DefaultPidsMax), func(v string) (err error) {
-		a.Limits.PidsMax, err = strconv.Atoi(v)
-		return
-	})
+	if v := strings.TrimSpace(in.CPU); v == "" {
+		a.Limits.CPUMax = app.DefaultCPUMax
+		if existing != nil {
+			a.Limits.CPUMax = existing.Limits.CPUMax
+		}
+	} else if n, err := strconv.ParseFloat(v, 64); err != nil {
+		errs = append(errs, fmt.Errorf("CPU: %q is not a number", v))
+	} else if !app.CPUChoice(n) && (existing == nil || n != existing.Limits.CPUMax) {
+		errs = append(errs, fmt.Errorf("CPU: choose 0.5, 1 or 2 cores (got %s)", v))
+	} else {
+		a.Limits.CPUMax = n
+	}
+	if existing == nil || a.Limits.PidsMax == 0 {
+		a.Limits.PidsMax = app.DefaultPidsMax
+	}
 	if len(errs) == 0 {
 		spec := app.Spec{Name: a.Name, Port: firstPort, HealthPath: "/", Limits: a.Limits}
 		if err := spec.Validate(); err != nil {
@@ -294,7 +309,7 @@ func (s *Service) validate(ctx context.Context, in Input, existing *App) (App, e
 			}
 			continue
 		}
-		if a.Domain != "" && sp.Domain == a.Domain {
+		if sp.Domain == a.Domain && a.Domain != "" {
 			errs = append(errs, fmt.Errorf("domain %s is already used by %s", a.Domain, sp.Name))
 		}
 	}
