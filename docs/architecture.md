@@ -33,7 +33,7 @@ internal/
   edge/           listener, IP filter, setup address, certificates, AOP, router, proxy, Cloudflare sync + cleanup
   cloudflare/     minimal REST client
   github/         token check, repos, branches, commits, source archives
-  source/         safe unpack of source archives
+  source/         safe unpack of source archives and the Go toolchain, ELF check
   manifest/       goboat.toml parsing
   builder/        go build in a bounded cgroup, toolchain and cache management
   deployer/       queue + pipeline, builds, rollback, history
@@ -62,9 +62,10 @@ All components are goroutines in one process (the systemd unit), talking through
   certs/<host>/{cert,key}.pem            Origin CA certs (0600)
   aop/{ca,client}.{pem,key}              goboat's AOP CA (RSA 3072, 10 y) + client cert (RSA 2048, 5 y)
   cache/{mod,build,home}/                Go module cache, build cache, HOME of builds (goboatbuild, 0700)
-  work/<app>/<build id>/                 build workspace (goboatbuild; emptied at start)
+  work/<app>/<deployment id>/            build workspace: source.tar.gz, src/ (root-owned), app, tmp/ (goboatbuild; emptied at start)
+  apps/<app>/builds/                     root:goboat-<app> 0750: only the app can enter its builds
   apps/<app>/builds/<build id>/src/      source tree at the commit, root-owned, read-only for the app (cwd)
-  apps/<app>/builds/<build id>/app       the built binary
+  apps/<app>/builds/<build id>/app       the built binary (root-owned)
   apps/<app>/current -> builds/<build id>
   apps/<app>/data/  tmp/                 DATA_DIR, TMPDIR (0700, app user)
   apps/<app>/logs/app.log[.1-3]          runtime log (10 MB × 3)
@@ -81,13 +82,13 @@ All components are goroutines in one process (the systemd unit), talking through
 | `sessions` | SHA-256 of the token, csrf, created/last seen, ip, user agent, `setup` flag |
 | `apps`, `app_env` | name, repo, branch, domain (required, unique), port, memory limit, CPU limit; env values* |
 | `app_state` | desired state (running/stopped) |
-| `builds` | per app: id, commit SHA, branch, commit subject, status, Go version used, `goboat.toml` values (package, args, health path), size, times, error |
-| `deployments` | history: kind (deploy, rollback, move), build id, status, error, times |
+| `builds` | the kept builds (at most 3 per app): id (first 12 hex digits of the commit), commit SHA, branch, commit subject, Go version used, `goboat.toml` values (package, args, health path), binary size, build time |
+| `deployments` | history: kind (deploy, rollback, move), build id, commit, branch, status (queued, building, deploying, succeeded, failed), error, times; a failed build is a failed deployment with the compiler output in its log |
 | `backups` | kind, status, object key, local path, size, sha256, per-database fingerprint, commit, error |
 | `edge_hosts` | per host: zone id, Origin CA cert id, expiry, DNS record ids (A, AAAA) |
 | `edge_zones` | per zone: SSL mode, AOP cert id/serial, AOP enforced |
 | `cf_cleanup` | Cloudflare objects to delete: kind (origin cert, AOP cert, DNS record, zone AOP setting), zone, object id, host, reason, attempts, last error, created |
-| `metrics_1m` | 7 days of 1-minute rollups per scope (`_host`, `_goboat`, `_build`, app) |
+| `metrics_1m` | 7 days of 1-minute rollups per scope (`_host`, `_goboat`, app) |
 
 `*` sealed with AES-256-GCM (`master.key`), purpose-bound (`settings:cloudflare_token`, `app_env:<app>:<NAME>` …), never shown in the UI. Migrations are numbered, one transaction each; a failing one rolls back and goboat refuses to start; a schema newer than the binary is refused naming both versions. goboat refuses to start if `master.key` is group/other-accessible or malformed.
 
@@ -97,9 +98,14 @@ All components are goroutines in one process (the systemd unit), talking through
 
 1. Checks Ubuntu ≥ 24.04, systemd, cgroup v2, the CPU, at least 1.8 GB RAM and 10 GB free disk.
 2. Downloads `goboat-linux-<arch>` + `checksums.txt` from the latest release (or `GOBOAT_VERSION=vX.Y.Z`), verifies SHA-256 and that the binary runs.
-3. Installs the latest stable **Go toolchain**: reads `https://go.dev/dl/?mode=json`, downloads `go<ver>.linux-<arch>.tar.gz`, verifies its SHA-256 from that index, unpacks it into `/usr/local/lib/goboat/go.new` and swaps it in. A Go already installed elsewhere on the server is never touched. Re-running the installer updates it.
-4. **Swap:** if the server has less than 2 GB of swap, creates `/goboat.swap` (2 GB, 0600, `mkswap`, `swapon`, an `/etc/fstab` line) and sets `vm.swappiness=10`. An existing swap setup of 2 GB or more is left as it is.
-5. Stops goboat, installs the binary, runs `goboat setup-host`: refuses to continue if another program holds port 443 (naming it), creates the directories, `master.key` and the `goboatbuild` user, writes and enables the embedded systemd unit (D10), runs migrations, stores a **new one-time password** (argon2id, 24 h), starts goboat and prints the setup address `https://<public IPv4>`, the password and the dashboard domain if any.
+3. Stops goboat, installs the binary and runs `goboat setup-host`, which:
+   - refuses to continue if another program holds port 443 (naming it);
+   - creates the directories, `master.key` and the `goboatbuild` user;
+   - installs the latest stable **Go toolchain**: reads `https://go.dev/dl/?mode=json`, downloads `go<ver>.linux-<arch>.tar.gz` from `dl.google.com`, verifies its SHA-256 from that index, unpacks it into `/usr/local/lib/goboat/go.new` and swaps it in. A Go installed elsewhere on the server is never touched. Re-running the installer updates it; if go.dev can't be reached, an installed toolchain is kept;
+   - **swap:** if the server has less than 2 GB of swap, creates `/goboat.swap` (2 GB, 0600, `mkswap`, `swapon`, an `/etc/fstab` line) and sets `vm.swappiness=10`. An existing swap setup of 2 GB or more is left as it is;
+   - writes and enables the embedded systemd unit (D10), runs migrations, stores a **new one-time password** (argon2id, 24 h), starts goboat and prints the setup address `https://<public IPv4>`, the password and the dashboard domain if any.
+
+   Measured on a 2 vCPU / 2 GB VPS: an update including the Go download and the swap file takes about 15 s.
 
 When the installer is given a move code (§10) it runs `goboat move-in` instead of printing a password. Re-running the installer is the **update** (keeps everything; apps restart) and the **recovery** path (forgotten password, broken domain). goboat never updates itself.
 
@@ -171,13 +177,13 @@ The dashboard is the only source of limits (D23): `goboat.toml` has no limit key
 ## 7. Builds and deploys
 
 ### 7.1 What is deployed
-The app page lists the 10 newest commits of the app's branch (`GET /repos/<o>/<r>/commits?sha=<branch>&per_page=10`, cached 1 min, newest preselected) with their short SHA, subject, author and date. goboat deploys **only on click**. One build or deployment runs at a time host-wide; others queue and the page shows their position. A build is identified by app + commit SHA; the newest 3 successful builds of each app are kept for rollback.
+The app page lists the 10 newest commits of the app's branch (`GET /repos/<o>/<r>/commits?sha=<branch>&per_page=10`, cached 1 min, newest preselected) with their short SHA, subject, author and date. goboat deploys **only on click**. One build or deployment runs at a time host-wide; others queue and the page shows their position. A build is identified by app + commit SHA (its id is the first 12 hex digits); the current build and the newest others, 3 in all, are kept for rollback. Deploying a commit that is still kept switches to it without rebuilding.
 
 ### 7.2 Pipeline
 
 ```
 1. Commit already built and kept → use that build (skip 2–6)
-2. GitHub API: GET /repos/<o>/<r>/tarball/<sha> (stored token; follow the redirect without the token; ≤ 100 MB)   [app keeps serving]
+2. GitHub API: GET /repos/<o>/<r>/commits/<sha>, then /tarball/<sha> (stored token; the redirect to codeload is followed without it; ≤ 100 MB)   [app keeps serving]
 3. Unpack into work/<app>/<id>/ (no absolute paths, "..", devices, escaping symlinks; ≤ 500 MB, ≤ 50 000 files)
 4. Read goboat.toml (contract, package, args, health_path); refuse unknown keys
 5. go build as goboatbuild in the build cgroup (§7.3), output to the build log
@@ -197,16 +203,28 @@ A failure in 2–6 never touches the running app, and errors name the cause (com
 | | |
 |---|---|
 | User | `goboatbuild` (system, no login); owns `work/<app>/<id>/` and `cache/` only |
-| cgroup | `goboat.service/builds/`: `memory.max` 1.5 GB, **swap allowed** (`memory.swap.max=max`), `cpu.weight` 20 (apps: 100), `io.weight` 20, `pids.max` 1024 |
+| cgroup | one per build, `goboat.service/builds/<app>-<deployment id>/`, removed afterwards (and at start): `memory.max` 1.5 GB or 3/4 of the RAM if that is less (1.4 GB on a "2 GB" VPS), **swap allowed** (`memory.swap.max` left at `max`), `cpu.weight` 20 (apps: 100), `io.weight` 20, `pids.max` 1024. `memory.peak` and `memory.swap.peak` are written to the deploy log |
 | Time | 15 minutes, then the cgroup is killed |
-| Command | `/usr/local/lib/goboat/go/bin/go build -trimpath -ldflags="-s -w" -o ../app <package>` in the source root |
-| Env | `PATH` (toolchain first), `HOME`/`GOPATH` under `cache/home`, `GOMODCACHE=cache/mod`, `GOCACHE=cache/build`, `CGO_ENABLED=0`, `GOTOOLCHAIN=auto`, `GOFLAGS=` (empty), `GONOSUMDB`/`GOPRIVATE` unset; never the app's env vars |
+| Command | `/usr/local/lib/goboat/go/bin/go build -trimpath -buildvcs=false -ldflags="-s -w" -o <workspace>/app <package>` in the source root |
+| Env | `PATH` (toolchain first), `HOME`/`GOPATH` under `cache/home`, `GOMODCACHE=cache/mod`, `GOCACHE=cache/build`, `TMPDIR=<workspace>/tmp`, `GOENV=off`, `GOTELEMETRY=off`, `CGO_ENABLED=0`, `GOTOOLCHAIN=auto`, `GOFLAGS=` (empty); never the app's env vars |
 | Network | needed for `proxy.golang.org`, `sum.golang.org` and toolchain downloads |
 
 - `go build` runs no code from the module or its dependencies (no cgo, no build scripts in Go), so the build sandbox mainly bounds resources; `goboat.toml` has no way to run commands.
 - `GOCACHE` trims itself (entries unused for 5 days). Before a build, if `cache/mod` is over 5 GB, it is emptied (`go clean -modcache`); the next build downloads what it needs again.
-- The Go version used (`go version` of the toolchain that built it, after `GOTOOLCHAIN` switching) is stored with the build and shown on the app page.
-- Build CPU, memory and swap are sampled like an app (scope `_build`) and shown on the deployment page; a build killed by the memory limit says so.
+- The Go version used (read from the built binary, so it is the toolchain after `GOTOOLCHAIN` switching) is stored with the build and shown on the app page.
+- A build killed by the memory limit (an `oom_kill` in its cgroup's `memory.events`) fails with "the build ran out of memory"; a build over 15 minutes, with "took longer than 15 minutes". Leftover processes are killed with the cgroup either way.
+
+Measured on a 2 vCPU / 1.9 GB VPS with two apps running (deploy log figures):
+
+| Build | Time | Peak memory | Peak swap | Result |
+|---|---|---|---|---|
+| Minimal app with `modernc.org/sqlite`, cold caches | 63 s | 1.2 GB | 0 | ok |
+| Same app after a one-line change | 1.2 s | 82 MB | 0 | ok |
+| App with SQLite, the AWS S3 SDK and the Prometheus client, cold | 32 s | 0.76 GB | 0 | ok |
+| Generated 63 MB map literal | 113 s | 1.4 GB | 1.1 GB | ok, using swap |
+| Generated 150 MB of map literals | 314 s | 1.4 GB | 2.0 GB | "ran out of memory" |
+
+During every one of these builds a running app answered its health check through Cloudflare without a failure (average 0.4–0.9 s through the proxy from outside, unchanged from idle).
 
 ## 8. Backups and restore
 
@@ -231,7 +249,7 @@ A failure in 2–6 never touches the running app, and errors name the cause (com
 
 ## 9. Monitoring
 
-Every 10 s: host (`/proc/stat`, `/proc/meminfo` including swap, `/proc/loadavg`, `statfs`), goboat itself (`/proc/self`), each app and the build cgroup (`cpu.stat`, `memory.current`, `memory.swap.current`, `pids.current`, `io.stat`, `memory.events`) and proxy counters (requests, 5xx, p50/p95 from a fixed histogram 5 ms … 10 s). CPU and I/O are counter deltas. 1 h of samples in memory (360 per scope); each minute is rolled up into `metrics_1m`, pruned after 7 days. Charts are SVGs rendered by goboat (`/charts?scope=&chart=&range=1h|24h|7d`). Warnings (dashboard only): disk > 85 %, memory > 90 %, swap in use outside builds, OOM kill in the last hour, app > 90 % of its memory limit, crashed, backup failed or local only, backup slot skipped, Cloudflare cleanup failing, cert expiring < 14 days, restart needed, setup step missing.
+Every 10 s: host (`/proc/stat`, `/proc/meminfo` including swap, `/proc/loadavg`, `statfs`), goboat itself (`/proc/self`), each app (`cpu.stat`, `memory.current`, `pids.current`, `io.stat`, `memory.events`) and proxy counters (requests, 5xx, p50/p95 from a fixed histogram 5 ms … 10 s). CPU and I/O are counter deltas. 1 h of samples in memory (360 per scope); each minute is rolled up into `metrics_1m`, pruned after 7 days. Charts are SVGs rendered by goboat (`/charts?scope=&chart=&range=1h|24h|7d`). Warnings (dashboard only): disk > 85 %, memory > 90 %, swap in use outside builds, OOM kill in the last hour, app > 90 % of its memory limit, crashed, backup failed or local only, backup slot skipped, Cloudflare cleanup failing, cert expiring < 14 days, restart needed, setup step missing.
 
 ## 10. Moving to another server
 
@@ -282,8 +300,8 @@ The old server serves `/move/v1/*` on its dashboard domain (through Cloudflare, 
 | Idle CPU | < 1 % |
 | Proxy overhead | < 1 ms p50 |
 | goboat binary | < 30 MB |
-| Rebuild of a small app after a one-line change (warm caches) | < 20 s |
-| First build of a small app (cold caches) | < 2 min |
+| Rebuild of a small app after a one-line change (warm caches) | < 20 s (measured: 1.2 s build, 2.8 s deploy) |
+| First build of a small app (cold caches) | < 2 min (measured: 63 s with SQLite) |
 | Deploy downtime (switch only) | < 1 s plus the app's start |
 | Server move downtime (small databases) | < 1 min |
 | Reboot to serving | seconds |

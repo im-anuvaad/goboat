@@ -47,7 +47,7 @@ When you press **Deploy** on a commit, goboat:
 3. Runs, in the repository root:
 
    ```
-   CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o <build dir>/app <package>
+   CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w" -o <build dir>/app <package>
    ```
 
 4. Checks that the result is a Linux executable for the server's CPU and keeps it next to the source tree (§7).
@@ -60,7 +60,8 @@ Details you can rely on:
 - **Nothing of yours runs during the build.** `go build` doesn't execute code from your module or its dependencies; `go generate` and tests are **not** run. Commit generated files, and keep running tests in your own CI if you have any.
 - **Your env vars are not passed to the build**, so secrets never reach the build. The build can't see `$DATA_DIR`.
 - **Builds share caches** (module cache and build cache), so a rebuild after a small change takes seconds. The first build of an app downloads its modules.
-- **Limits per build:** 1.5 GB of memory plus the server's swap, 15 minutes, lower CPU priority than the running apps. One build runs at a time on the server; the app keeps serving its current version while its new one builds.
+- **No version control info** is stamped into the binary (`-buildvcs=false`: the archive has no `.git`). Read the commit from `GOBOAT_COMMIT` (§5) instead of `debug.ReadBuildInfo`.
+- **Limits per build:** 1.5 GB of memory (1.4 GB on a 2 GB server) plus the server's swap, 15 minutes, lower CPU priority than the running apps. One build runs at a time on the server; the app keeps serving its current version while its new one builds. A build that needs more fails with "the build ran out of memory"; that takes a lot (on a 2 GB server, a minimal app with `modernc.org/sqlite` peaks at 1.2 GB on its first build and about 80 MB on later ones).
 - **Source size:** the downloaded archive may be at most 100 MB, the unpacked tree 500 MB.
 
 Embedding templates and static files with `//go:embed` is the simplest way to ship them. Files read at runtime with relative paths also work, because the app runs in its source tree (§7).
