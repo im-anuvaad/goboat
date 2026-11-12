@@ -249,6 +249,9 @@ func newTestEdge(t *testing.T) *testEdge {
 		t.Fatal(err)
 	}
 	m.Router = &Router{Log: log}
+	// Background syncs (started by RemoveHost) must end before the temp
+	// dirs go.
+	t.Cleanup(func() { m.PauseAndWait("test done") })
 	sealed, _ := box.Seal([]byte("tok"), purposeCFToken)
 	st.SetSetting(ctx, SettingCFToken, sealed)
 	m.pubV4, m.pubV6 = "192.0.2.1", "off"

@@ -24,6 +24,7 @@ import (
 	"github.com/im-anuvaad/goboat/internal/layout"
 	"github.com/im-anuvaad/goboat/internal/logs"
 	"github.com/im-anuvaad/goboat/internal/metrics"
+	"github.com/im-anuvaad/goboat/internal/move"
 	"github.com/im-anuvaad/goboat/internal/secrets"
 	"github.com/im-anuvaad/goboat/internal/store"
 	"github.com/im-anuvaad/goboat/internal/supervisor"
@@ -95,12 +96,22 @@ func serve(log *slog.Logger) error {
 	defer stop()
 
 	authSvc := auth.New(st)
-	edgeMgr, err := newEdge(ctx, log, lay, st, box, sup, dep, authSvc)
+	ms := &moveState{}
+	edgeMgr, err := newEdge(ctx, log, lay, st, box, sup, dep, authSvc, ms)
 	if err != nil {
 		return err
 	}
+	incoming, isIncoming, err := move.LoadIncoming(ctx, st, box)
+	if err != nil {
+		return fmt.Errorf("reading the incoming move: %w", err)
+	}
+	if isIncoming {
+		edgeMgr.Pause("this server is taking over from " + incoming.URL)
+		log.Info("taking over from another server: Cloudflare syncs, backups and app starts wait for the switch", "from", incoming.URL)
+	}
 
 	bk := newBackups(lay, st, box, sup, dep, log)
+	bk.Paused = func() bool { return ms.handingOver.Load() || ms.moved.Load() }
 	iv, rt := bk.Policy()
 	log.Info("backups", "every", iv, "keep", rt)
 	if err := bk.Init(ctx); err != nil {
@@ -117,6 +128,15 @@ func serve(log *slog.Logger) error {
 
 	appSvc := apps.New(st, box, dep, sup, edgeMgr, edgeMgr.DashboardHost, log)
 	appSvc.SetBackups(bk)
+	mv := newMoveSource(lay, st, box, log, authSvc, sup, dep, edgeMgr, bk, ms)
+	if err := mv.Load(ctx); err != nil {
+		log.Warn("reading the move state", "err", err)
+	}
+	if m, ok := mv.MovedTo(ctx); ok {
+		ms.moved.Store(true)
+		edgeMgr.Pause(fmt.Sprintf("this server was moved to %s on %s", m.IP, m.At.UTC().Format(time.DateOnly)))
+		log.Warn("this server was moved to another one: it serves no apps, takes no backups and changes nothing at Cloudflare", "new_server", m.IP, "at", m.At)
+	}
 	// Cleanup never touches a configured domain, even of an app that fails
 	// to load.
 	edgeMgr.SetKnownHosts(func(ctx context.Context) ([]string, error) {
@@ -144,7 +164,7 @@ func serve(log *slog.Logger) error {
 
 	dash := &web.Server{
 		Auth: authSvc, Apps: appSvc, Dep: dep, Sup: sup, Edge: edgeMgr, Store: st,
-		Backups: bk, Metrics: mc,
+		Backups: bk, Metrics: mc, Move: mv,
 		Thresholds: web.Thresholds{DiskPercent: 85, MemoryPercent: 90, CertDays: 14},
 		Layout:     lay, Version: buildinfo.Version, Log: log.With("component", "web"),
 	}
@@ -162,9 +182,16 @@ func serve(log *slog.Logger) error {
 	edgeMgr.Run(runCtx)
 
 	dep.Run(runCtx)
-	bk.Schedule(runCtx)
 	mc.Run(runCtx)
-	go sup.StartAll(runCtx, func(name string) bool { return dep.DesiredRunning(runCtx, name) })
+	switch {
+	case ms.moved.Load():
+		// Retired: nothing runs.
+	case isIncoming:
+		go runIncoming(runCtx, incoming, lay, st, log, sup, dep, edgeMgr, bk, appSvc, stop)
+	default:
+		bk.Schedule(runCtx)
+		go sup.StartAll(runCtx, func(name string) bool { return dep.DesiredRunning(runCtx, name) })
+	}
 
 	usr1 := make(chan os.Signal, 1)
 	signal.Notify(usr1, syscall.SIGUSR1)
@@ -253,7 +280,7 @@ func waitUploads(log *slog.Logger, bk *backup.Service, max time.Duration) {
 
 // newEdge creates the edge manager and its router (not started yet).
 func newEdge(ctx context.Context, log *slog.Logger, lay layout.Layout, st *store.Store, box *secrets.Box,
-	sup *supervisor.Supervisor, dep *deployer.Deployer, au *auth.Auth) (*edge.Manager, error) {
+	sup *supervisor.Supervisor, dep *deployer.Deployer, au *auth.Auth, ms *moveState) (*edge.Manager, error) {
 	m, err := edge.NewManager(ctx, edge.Config{
 		Listen: ":443", AOP: true, DataRoot: lay.Root,
 		SetupPending: func() bool { return !au.SetupUntil().IsZero() },
@@ -264,6 +291,9 @@ func newEdge(ctx context.Context, log *slog.Logger, lay layout.Layout, st *store
 	m.Router = &edge.Router{
 		Log: log,
 		State: func(name string) edge.Availability {
+			if ms.handingOver.Load() || ms.moved.Load() {
+				return edge.Moving
+			}
 			if dep.Deploying(name) {
 				return edge.Deploying
 			}

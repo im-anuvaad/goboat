@@ -22,6 +22,8 @@ and systemd:
 
   version      Print version information
   setup-host   Prepare the host, start goboat, print a one-time password (run by install.sh)
+  move-in URL CODE
+               Prepare the host and take over the goboat at URL (run by install.sh move)
   serve        Run the goboat service (run by systemd)
 `
 
@@ -47,6 +49,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 		return runServe(stderr)
+	case "move-in":
+		if len(args) != 3 {
+			fmt.Fprint(stderr, usage)
+			return 2
+		}
+		return runMoveIn(args[1], args[2], stdout, stderr)
 	case "setup-host":
 		if len(args) > 1 {
 			fmt.Fprint(stderr, usage)

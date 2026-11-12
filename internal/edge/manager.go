@@ -99,6 +99,7 @@ type Manager struct {
 	pubV4     string
 	pubV6     string
 	unused    []UnusedCert
+	paused    string // why Cloudflare syncs are off ("" = they run)
 	retry     int
 	retryT    *time.Timer
 }
@@ -594,10 +595,47 @@ func missingPermissions(ctx context.Context, c *cloudflare.Client, z cloudflare.
 	return missing
 }
 
+// Pause turns Cloudflare syncs off (no DNS, certificate or cleanup calls)
+// until Resume: while a server move hands over (docs/architecture.md §10),
+// and for good on a server that was moved.
+func (m *Manager) Pause(why string) {
+	m.mu.Lock()
+	m.paused = why
+	m.mu.Unlock()
+}
+
+// PauseAndWait pauses syncs and waits for a sync that is running to end,
+// so nothing changes at Cloudflare after it returns.
+func (m *Manager) PauseAndWait(why string) {
+	m.Pause(why)
+	m.syncMu.Lock()
+	//lint:ignore SA2001 waiting for a running sync is the point; Sync checks the pause again under syncMu
+	m.syncMu.Unlock()
+}
+
+// Resume turns Cloudflare syncs back on.
+func (m *Manager) Resume() {
+	m.mu.Lock()
+	m.paused = ""
+	m.mu.Unlock()
+}
+
 // Sync reconciles DNS records, certificates, AOP and SSL mode checks.
 func (m *Manager) Sync(ctx context.Context) (Status, error) {
+	m.mu.RLock()
+	paused := m.paused
+	m.mu.RUnlock()
+	if paused != "" {
+		return m.Status(ctx), errors.New("Cloudflare sync is paused: " + paused)
+	}
 	m.syncMu.Lock()
 	defer m.syncMu.Unlock()
+	m.mu.RLock()
+	paused = m.paused
+	m.mu.RUnlock()
+	if paused != "" { // paused while this sync waited for the previous one
+		return Status{}, errors.New("Cloudflare sync is paused: " + paused)
+	}
 	err := m.sync(ctx)
 	m.mu.Lock()
 	m.lastSync = time.Now()
@@ -750,6 +788,21 @@ func (m *Manager) syncHost(ctx context.Context, c *cloudflare.Client, h hostEntr
 			return fmt.Errorf("DNS: %w", err)
 		}
 		dns = append(dns, "AAAA "+v6+" ("+res+")")
+	} else {
+		// No IPv6 here: an AAAA record (e.g. of the server this one
+		// replaced) would send part of the visitors elsewhere.
+		rs, err := c.DNSRecords(ctx, z.ID, h.Host)
+		if err != nil {
+			return fmt.Errorf("DNS: %w", err)
+		}
+		for _, r := range rs {
+			if r.Type == "AAAA" {
+				if err := c.DeleteDNSRecord(ctx, z.ID, r.ID); err != nil && !cloudflare.IsNotFound(err) {
+					return fmt.Errorf("DNS: %w", err)
+				}
+				dns = append(dns, "AAAA "+r.Content+" (deleted: this server has no IPv6)")
+			}
+		}
 	}
 	hs.DNS = strings.Join(dns, ", ")
 

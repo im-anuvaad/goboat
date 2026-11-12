@@ -24,6 +24,7 @@ const (
 const (
 	KindDeploy   = "deploy"
 	KindRollback = "rollback"
+	KindMove     = "move" // built by a server taking over (no switch)
 )
 
 // Deployment is one row of the deploy history.

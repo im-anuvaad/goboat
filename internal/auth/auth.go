@@ -302,6 +302,13 @@ func (a *Auth) ChangeEmail(ctx context.Context, password, email, ip string) erro
 	return err
 }
 
+// Allow reports ErrRateLimited when ip (or everyone) failed too often;
+// other credentials checks (the move code) share the sign-in limit.
+func (a *Auth) Allow(ip string) error { return a.allow(ip) }
+
+// Fail records a failed credential check by ip.
+func (a *Auth) Fail(ip string) { a.fail(ip) }
+
 func (a *Auth) allow(ip string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()

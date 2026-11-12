@@ -33,6 +33,7 @@ const (
 	Deploying               // 503 "deploying"
 	Starting                // 503 "starting"
 	NotRunning              // 503 "not running"
+	Moving                  // 503 "moving to a new server" (docs/architecture.md §10)
 )
 
 // Router routes by Host header to the dashboard or to app proxies.
@@ -182,6 +183,8 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	sw := &statusWriter{ResponseWriter: w}
 	switch rt.State(p.route.App) {
+	case Moving:
+		page(sw, http.StatusServiceUnavailable, "Moving", "The site is moving to a new server and is back in a minute.", 10)
 	case Deploying:
 		page(sw, http.StatusServiceUnavailable, "Deploying", "A new version is being deployed. This takes a few seconds.", 3)
 	case Starting:

@@ -12,6 +12,7 @@ import (
 	"github.com/im-anuvaad/goboat/internal/edge"
 	"github.com/im-anuvaad/goboat/internal/github"
 	"github.com/im-anuvaad/goboat/internal/hostinfo"
+	"github.com/im-anuvaad/goboat/internal/move"
 )
 
 // Templates are only checked when executed, so render the main pages with
@@ -42,12 +43,20 @@ func TestTemplatesRender(t *testing.T) {
 			BuildTime: 63 * time.Second, BuildCPU: 110 * time.Second, PeakMemory: 1 << 30, PeakSwap: 100 << 20}, "Log": "x"},
 		"backups": map[string]any{"Name": "web", "Count": 2, "Policy": "every 10m", "Days": []BackupDay{{Day: "Thursday 12 November 2026",
 			Backups: []backup.Backup{{ID: 2, App: "web", Kind: "scheduled", Status: "ok", ObjectKey: "web/x", Size: 500, CreatedAt: time.Now()}, {ID: 1, Status: "failed", Error: "boom"}}}}},
+		"move": map[string]any{"State": move.State{Phase: move.PhaseReady, NewIP: "198.51.100.2", Steps: []move.Step{{At: time.Now(), App: "web", Text: "built"}, {Text: "x", Failed: true}}},
+			"Active": true, "DashboardReady": true, "Apps": []AppRow{row}},
 		"settings": map[string]any{"Edge": edge.Status{Dashboard: "d.example.com", TokenSet: true}, "Policy": "every 3h"},
 	}
 	for name, data := range pages {
 		var b bytes.Buffer
 		if err := s.pages[name].ExecuteTemplate(&b, "layout", Page{Title: name, CSRF: "x", Data: data}); err != nil {
 			t.Errorf("%s: %v", name, err)
+		}
+	}
+	for _, st := range []move.State{{}, {Phase: move.PhaseWaiting, Expires: time.Now().Add(time.Hour)}, {Phase: move.PhaseSwitching}, {Phase: move.PhaseDone}, {Phase: move.PhaseFailed, Error: "boom"}} {
+		var b bytes.Buffer
+		if err := s.pages["move"].ExecuteTemplate(&b, "layout", Page{CSRF: "x", Data: map[string]any{"State": st, "Active": st.Active(), "DashboardReady": true, "Command": "curl"}}); err != nil {
+			t.Errorf("move page in phase %q: %v", st.Phase, err)
 		}
 	}
 	// An empty branch: the page says so.

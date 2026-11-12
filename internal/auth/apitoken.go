@@ -135,6 +135,12 @@ func (a *Auth) saveAPIToken(ctx context.Context, rec apiTokenRecord) error {
 	return a.db.SetSetting(ctx, settingAPIToken, b)
 }
 
+// CheckPassword checks the admin's password (re-authentication for a
+// sensitive action), with the sign-in rate limit.
+func (a *Auth) CheckPassword(ctx context.Context, password, ip string) error {
+	return a.verifyAdminPassword(ctx, password, ip)
+}
+
 // verifyAdminPassword checks password against the admin's, with the
 // sign-in rate limit.
 func (a *Auth) verifyAdminPassword(ctx context.Context, password, ip string) error {

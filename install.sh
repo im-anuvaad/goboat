@@ -19,6 +19,10 @@
 # password, broken dashboard domain).
 #
 #   GOBOAT_VERSION=v1.0.0   install that release instead of the latest
+#
+# Moving an installation to this server (docs/architecture.md §10): the old
+# server's Settings → Move to another server shows the full command, e.g.
+#   curl -fsSL .../install.sh | sudo GOBOAT_VERSION=v1.0.0 bash -s -- move https://<old dashboard> <move code>
 set -euo pipefail
 
 REPO="im-anuvaad/goboat"
@@ -104,10 +108,22 @@ install_binary() {
 }
 
 main() {
+  local mode=install
+  if [ "${1:-}" = "move" ]; then
+    [ $# -eq 3 ] || fail "usage: install.sh move https://<old dashboard domain> <move code> (copy the command from the old server's Move page)"
+    mode=move
+  elif [ $# -gt 0 ]; then
+    fail "unknown arguments: $*"
+  fi
   check_host
   download
   install_binary
-  "$INSTALL_PATH" setup-host
+  if [ "$mode" = move ]; then
+    say "Taking over from $2"
+    "$INSTALL_PATH" move-in "$2" "$3"
+  else
+    "$INSTALL_PATH" setup-host
+  fi
 }
 
 main "$@"
