@@ -84,6 +84,7 @@ func newMoveSource(lay layout.Layout, st *store.Store, box *secrets.Box, log *sl
 			},
 			Moved: func(m move.Moved) {
 				ms.moved.Store(true)
+				e.DropConnections()
 				e.PauseAndWait(fmt.Sprintf("this server was moved to %s on %s", m.IP, m.At.UTC().Format(time.DateOnly)))
 				log.Info("this server was moved; it no longer serves apps, backs up or changes anything at Cloudflare", "new_server", m.IP)
 			},

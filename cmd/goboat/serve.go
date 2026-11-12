@@ -134,6 +134,7 @@ func serve(log *slog.Logger) error {
 	}
 	if m, ok := mv.MovedTo(ctx); ok {
 		ms.moved.Store(true)
+		edgeMgr.DropConnections()
 		edgeMgr.Pause(fmt.Sprintf("this server was moved to %s on %s", m.IP, m.At.UTC().Format(time.DateOnly)))
 		log.Warn("this server was moved to another one: it serves no apps, takes no backups and changes nothing at Cloudflare", "new_server", m.IP, "at", m.At)
 	}

@@ -100,6 +100,8 @@ type Manager struct {
 	pubV6     string
 	unused    []UnusedCert
 	paused    string // why Cloudflare syncs are off ("" = they run)
+	srv       *http.Server
+	noKeep    bool // retired: no keep-alive connections
 	retry     int
 	retryT    *time.Timer
 }
@@ -464,6 +466,12 @@ func (m *Manager) Serve(ctx context.Context) error {
 		MaxHeaderBytes:    64 << 10,
 		ErrorLog:          stdlog.New(&serverErrors{log: m.log}, "", 0),
 	}
+	m.mu.Lock()
+	m.srv = srv
+	if m.noKeep {
+		srv.SetKeepAlivesEnabled(false)
+	}
+	m.mu.Unlock()
 	go func() {
 		<-ctx.Done()
 		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -611,6 +619,19 @@ func (m *Manager) PauseAndWait(why string) {
 	m.syncMu.Lock()
 	//lint:ignore SA2001 waiting for a running sync is the point; Sync checks the pause again under syncMu
 	m.syncMu.Unlock()
+}
+
+// DropConnections closes idle keep-alive connections and keeps every later
+// one to a single request. Cloudflare reuses its connections to an origin
+// for minutes; a server that was moved must not keep answering on them
+// once DNS points elsewhere (docs/architecture.md §10).
+func (m *Manager) DropConnections() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.noKeep = true
+	if m.srv != nil {
+		m.srv.SetKeepAlivesEnabled(false)
+	}
 }
 
 // Resume turns Cloudflare syncs back on.
