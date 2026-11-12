@@ -99,6 +99,7 @@ func (s *Server) Handler() (http.Handler, error) {
 	authed("POST /apps/{app}/env/delete", s.deleteEnv)
 	authed("POST /apps/{app}/delete", s.deleteApp)
 	authed("POST /apps/{app}/backup", s.backupNow)
+	authed("GET /apps/{app}/backups", s.backupsPage)
 	authed("POST /apps/{app}/restore", s.restoreBackup)
 	authed("POST /settings/s3", s.setS3)
 	authed("POST /settings/dashboard-domain", s.setDashboardDomain)

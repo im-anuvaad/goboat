@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/im-anuvaad/goboat/internal/apps"
+	"github.com/im-anuvaad/goboat/internal/backup"
 	"github.com/im-anuvaad/goboat/internal/deployer"
 	"github.com/im-anuvaad/goboat/internal/edge"
 	"github.com/im-anuvaad/goboat/internal/github"
@@ -33,11 +34,14 @@ func TestTemplatesRender(t *testing.T) {
 				Subject: "Fix", GoVersion: "go1.27.4", BuildTime: 12 * time.Second, Current: true}, {App: "web", ID: "aaaaaaaaaaaa", GitSHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
 			"Branch": "main", "Commits": commits,
 			"Edit": apps.Input{Repo: row.Repo}, "EdgeHost": edge.HostStatus{Host: "web.example.com"},
-			"MemChoices": mem, "CPUChoices": cpu, "Budget": Budget{Others: 256 << 20, Total: 512 << 20, RAM: 2 << 30}},
+			"MemChoices": mem, "CPUChoices": cpu, "Budget": Budget{Others: 256 << 20, Total: 512 << 20, RAM: 2 << 30},
+			"Backups": []backup.Backup{{ID: 1, Status: "ok", LocalPath: "/x"}}, "MoreBackups": true, "Check": backup.Check{At: time.Now(), Unchanged: true, Since: time.Now()}},
 		"app_new": map[string]any{"In": apps.Input{RestoreFrom: apps.AutoFolder}, "BucketSet": true, "Folders": []string{"web"},
 			"MemChoices": mem, "CPUChoices": cpu, "Budget": Budget{Total: 256 << 20, RAM: 2 << 30}},
 		"deployment": map[string]any{"D": deployer.Deployment{ID: 3, App: "web", Status: "succeeded", GitSHA: "3f9c2a1e5b7d4c0a9e8f6b1d2c3a4e5f60718293",
 			BuildTime: 63 * time.Second, BuildCPU: 110 * time.Second, PeakMemory: 1 << 30, PeakSwap: 100 << 20}, "Log": "x"},
+		"backups": map[string]any{"Name": "web", "Count": 2, "Policy": "every 10m", "Days": []BackupDay{{Day: "Thursday 12 November 2026",
+			Backups: []backup.Backup{{ID: 2, App: "web", Kind: "scheduled", Status: "ok", ObjectKey: "web/x", Size: 500, CreatedAt: time.Now()}, {ID: 1, Status: "failed", Error: "boom"}}}}},
 		"settings": map[string]any{"Edge": edge.Status{Dashboard: "d.example.com", TokenSet: true}, "Policy": "every 3h"},
 	}
 	for name, data := range pages {

@@ -99,7 +99,8 @@
     <form method="post" action="/apps/{{.Name}}/backup" class="inline">{{template "csrf" $csrf}}<button>Back up now</button></form>
   </div>
   {{with .BackupProblem}}<p class="error">{{.}}</p>{{end}}
-  <p class="muted">SQLite files in DATA_DIR are backed up {{$.Data.Policy}} (the newest is always kept), to the bucket folder <code>{{.Name}}/</code>. The last 2 are also kept on this server.{{if not $.Data.S3Set}} <b>No bucket is configured</b>, so they are only on this server.{{end}}</p>
+  <p class="muted">SQLite files in DATA_DIR are backed up {{$.Data.Policy}} (the newest is always kept), to the bucket folder <code>{{.Name}}/</code>. A scheduled backup is skipped when the databases haven't changed. The last 2 are also kept on this server.{{if not $.Data.S3Set}} <b>No bucket is configured</b>, so they are only on this server.{{end}}</p>
+  {{with $.Data.Check}}<p class="muted">Last check {{ago .At}}: {{if .Unchanged}}unchanged since the backup of {{datetime .Since}}, so none was taken{{else}}changed, backed up{{end}}.</p>{{end}}
   {{with $.Data.Backups}}
   <table class="stack">
     <thead><tr><th>#</th><th>Taken</th><th>Kind</th><th>Status</th><th>Size</th><th>Where</th><th>Commit</th><th></th></tr></thead>
@@ -114,6 +115,7 @@
     </tr>{{end}}
     </tbody>
   </table>
+  {{if $.Data.MoreBackups}}<p><a href="/apps/{{$.Data.App.Name}}/backups">Show all backups</a> <span class="muted">(the newest 20 are shown here)</span></p>{{end}}
   {{else}}<p class="muted">No backups yet.</p>{{end}}
 </section>
 

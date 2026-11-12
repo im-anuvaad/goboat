@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"fmt"
+	"github.com/im-anuvaad/goboat/internal/backup"
 	"math"
 	"net/http"
 	"time"
@@ -227,6 +228,11 @@ func (s *Server) metricWarnings(ctx context.Context, rows []AppRow) []string {
 			if pct := 100 * float64(p.Mem) / float64(p.MemLimit); pct > th.MemoryPercent {
 				ws = append(ws, fmt.Sprintf("Memory is %.0f%% used (%s of %s). Apps may be killed for running out of memory.", pct, fmtBytes(float64(p.Mem)), fmtBytes(float64(p.MemLimit))))
 			}
+		}
+	}
+	if s.Backups != nil {
+		if n := s.Backups.SkippedSince(time.Now().Add(-time.Hour)); n > 0 {
+			ws = append(ws, fmt.Sprintf("Backups: %d scheduled run(s) in the last hour were skipped because the previous run took longer than %s. Backups of large databases are slow; check the backup log in the server journal.", n, shortDur(backup.Interval)))
 		}
 	}
 	if n := s.Metrics.SwappedOutsideBuilds(); n >= 64<<20 {

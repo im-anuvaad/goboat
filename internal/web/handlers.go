@@ -383,7 +383,14 @@ func (s *Server) appPage(w http.ResponseWriter, r *http.Request) {
 		deps, _ := s.Dep.Deployments(r.Context(), name, 10)
 		data["Deployments"] = deps
 		if s.Backups != nil {
-			data["Backups"], _ = s.Backups.List(r.Context(), name)
+			bs, _ := s.Backups.List(r.Context(), name, appPageBackups+1)
+			if len(bs) > appPageBackups {
+				bs, data["MoreBackups"] = bs[:appPageBackups], true
+			}
+			data["Backups"] = bs
+			if c, ok := s.Backups.LastCheck(name); ok {
+				data["Check"] = c
+			}
 			_, data["S3Set"], _ = s.Backups.S3Config(r.Context())
 			data["Policy"] = s.policyText()
 		}
@@ -402,6 +409,38 @@ func (s *Server) appPage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.render(w, r, http.StatusOK, "app", name, "apps", data)
+}
+
+// appPageBackups is how many backups the app page lists.
+const appPageBackups = 20
+
+// BackupDay is one day of an app's backups, for the full list.
+type BackupDay struct {
+	Day     string
+	Backups []backup.Backup
+}
+
+// backupsPage lists every backup of an app, grouped by day.
+func (s *Server) backupsPage(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("app")
+	if s.Sup.Get(name) == nil || s.Backups == nil {
+		s.errorPage(w, r, http.StatusNotFound, fmt.Errorf("app %q not found", name))
+		return
+	}
+	bs, err := s.Backups.List(r.Context(), name, 0)
+	if err != nil {
+		s.errorPage(w, r, http.StatusInternalServerError, err)
+		return
+	}
+	var days []BackupDay
+	for _, b := range bs {
+		day := b.CreatedAt.Local().Format("Monday 2 January 2006")
+		if len(days) == 0 || days[len(days)-1].Day != day {
+			days = append(days, BackupDay{Day: day})
+		}
+		days[len(days)-1].Backups = append(days[len(days)-1].Backups, b)
+	}
+	s.render(w, r, http.StatusOK, "backups", name+" backups", "apps", map[string]any{"Name": name, "Days": days, "Count": len(bs), "Policy": s.policyText()})
 }
 
 func humanLimit(n int64) string {

@@ -39,10 +39,17 @@ const (
 
 // Policy (docs/architecture.md, Backups). It is fixed.
 const (
-	Interval       = 3 * time.Hour
+	Interval       = 10 * time.Minute
 	Retention      = 48 * time.Hour
 	KeepLocal      = 2
 	uploadAttempts = 3
+	// RetainEvery is how often the bucket folder of an app is listed to
+	// delete expired archives (not after every upload: that would be 144
+	// listings a day per app).
+	RetainEvery = time.Hour
+	// While uploads fail, the newest KeepUnuploaded local copies are kept,
+	// and of older ones the newest of each hour, until the retention ends.
+	KeepUnuploaded = 6
 )
 
 // Settings keys.
@@ -55,6 +62,10 @@ const (
 
 // ErrNoDatabases means DATA_DIR has no SQLite files, so nothing to back up.
 var ErrNoDatabases = errors.New("no SQLite databases in DATA_DIR")
+
+// ErrUnchanged means a scheduled backup was skipped: the databases did not
+// change since the latest backup.
+var ErrUnchanged = errors.New("databases unchanged since the latest backup")
 
 // Backup is one row of the backups table.
 type Backup struct {
@@ -71,6 +82,8 @@ type Backup struct {
 	Error      string    `json:"error"`
 	CreatedAt  time.Time `json:"created_at"`
 	FinishedAt time.Time `json:"finished_at"`
+	// Fingerprint of the databases when the backup was taken.
+	Fingerprint string `json:"-"`
 }
 
 // Uploaded reports whether the archive is in the bucket.
@@ -108,6 +121,49 @@ type Service struct {
 
 	mu      sync.Mutex // one backup/restore at a time
 	uploads sync.WaitGroup
+
+	stateMu    sync.Mutex
+	checks     map[string]Check     // app -> last scheduled check
+	lastRetain map[string]time.Time // app -> last bucket retention pass
+	skipped    []time.Time          // scheduled slots missed because a run overran
+}
+
+// Check is the result of the last scheduled check of an app.
+type Check struct {
+	At        time.Time // when it was checked
+	Unchanged bool      // nothing changed since the latest backup: none taken
+	Since     time.Time // when that latest backup was taken
+}
+
+// LastCheck returns the last scheduled check of app.
+func (s *Service) LastCheck(app string) (Check, bool) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	c, ok := s.checks[app]
+	return c, ok
+}
+
+func (s *Service) noteCheck(app string, c Check) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if s.checks == nil {
+		s.checks = map[string]Check{}
+	}
+	s.checks[app] = c
+}
+
+// SkippedSince is how many scheduled slots were missed since t because a
+// run took longer than the interval.
+func (s *Service) SkippedSince(t time.Time) int {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	n := 0
+	for _, at := range s.skipped {
+		if at.After(t) {
+			n++
+		}
+	}
+	return n
 }
 
 func (s *Service) stagingDir() string { return filepath.Join(s.Layout.Root, "backups", "staging") }
@@ -234,12 +290,12 @@ func Folder(app string) string { return app + "/" }
 
 // ---------------------------------------------------------------- rows
 
-const cols = `id, app, kind, status, object_key, local_path, size, sha256, files, git_sha, error, created_at, finished_at`
+const cols = `id, app, kind, status, object_key, local_path, size, sha256, files, git_sha, error, created_at, finished_at, fingerprint`
 
 func scan(r interface{ Scan(...any) error }) (Backup, error) {
 	var b Backup
 	var c, f int64
-	err := r.Scan(&b.ID, &b.App, &b.Kind, &b.Status, &b.ObjectKey, &b.LocalPath, &b.Size, &b.SHA256, &b.Files, &b.GitSHA, &b.Error, &c, &f)
+	err := r.Scan(&b.ID, &b.App, &b.Kind, &b.Status, &b.ObjectKey, &b.LocalPath, &b.Size, &b.SHA256, &b.Files, &b.GitSHA, &b.Error, &c, &f, &b.Fingerprint)
 	b.CreatedAt = time.Unix(c, 0)
 	if f != 0 {
 		b.FinishedAt = time.Unix(f, 0)
@@ -247,9 +303,12 @@ func scan(r interface{ Scan(...any) error }) (Backup, error) {
 	return b, err
 }
 
-// List returns an app's backups, newest first.
-func (s *Service) List(ctx context.Context, app string) ([]Backup, error) {
-	rows, err := s.Store.Reader().QueryContext(ctx, `SELECT `+cols+` FROM backups WHERE app = ? ORDER BY id DESC`, app)
+// List returns an app's backups, newest first (limit <= 0: all of them).
+func (s *Service) List(ctx context.Context, app string, limit int) ([]Backup, error) {
+	if limit <= 0 {
+		limit = -1
+	}
+	rows, err := s.Store.Reader().QueryContext(ctx, `SELECT `+cols+` FROM backups WHERE app = ? ORDER BY id DESC LIMIT ?`, app, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -272,6 +331,12 @@ func (s *Service) Get(ctx context.Context, id int64) (Backup, error) {
 		return b, fmt.Errorf("backup #%d not found", id)
 	}
 	return b, err
+}
+
+// latestOK returns the newest successful backup of app.
+func (s *Service) latestOK(ctx context.Context, app string) (Backup, bool) {
+	b, err := scan(s.Store.Reader().QueryRowContext(ctx, `SELECT `+cols+` FROM backups WHERE app = ? AND status = ? ORDER BY id DESC LIMIT 1`, app, StatusOK))
+	return b, err == nil
 }
 
 // Latest returns the newest finished backup of app.
@@ -349,6 +414,15 @@ func (s *Service) run(ctx context.Context, app, kind string, wait bool, lg *logs
 	if len(dbs) == 0 {
 		return Backup{}, ErrNoDatabases
 	}
+	// Taken before the snapshot: a write during it changes the files
+	// again, so the next check takes another backup.
+	fp := Fingerprint(dataDir, dbs)
+	if kind == KindScheduled {
+		if last, ok := s.latestOK(ctx, app); ok && last.Fingerprint == fp {
+			s.noteCheck(app, Check{At: time.Now(), Unchanged: true, Since: last.CreatedAt})
+			return last, ErrUnchanged
+		}
+	}
 	commit := ""
 	if s.Hooks.Commit != nil {
 		commit = s.Hooks.Commit(app)
@@ -391,8 +465,11 @@ func (s *Service) run(ctx context.Context, app, kind string, wait bool, lg *logs
 	if err != nil {
 		return fail(err)
 	}
-	s.exec(`UPDATE backups SET status = ?, local_path = ?, size = ?, sha256 = ?, files = ?, finished_at = ? WHERE id = ?`,
-		StatusOK, local, size, sum, len(dbs), time.Now().Unix(), id)
+	s.exec(`UPDATE backups SET status = ?, local_path = ?, size = ?, sha256 = ?, files = ?, finished_at = ?, fingerprint = ? WHERE id = ?`,
+		StatusOK, local, size, sum, len(dbs), time.Now().Unix(), fp, id)
+	if kind == KindScheduled {
+		s.noteCheck(app, Check{At: time.Now(), Since: start})
+	}
 	note(lg, "backup #%d: %d database(s), %s, snapshot took %s", id, len(dbs), human(size), time.Since(start).Round(10*time.Millisecond))
 	s.Log.Info("backup taken", "app", app, "kind", kind, "id", id, "databases", len(dbs), "bytes", size)
 	s.pruneLocal(app)
@@ -442,6 +519,18 @@ func (s *Service) upload(ctx context.Context, id int64, app, local, name string,
 	s.exec(`UPDATE backups SET object_key = ?, error = '' WHERE id = ?`, key, id)
 	note(lg, "backup #%d uploaded to %s", id, key)
 	s.Log.Info("backup uploaded", "app", app, "id", id, "key", key)
+	s.stateMu.Lock()
+	due := time.Since(s.lastRetain[app]) >= RetainEvery
+	if due {
+		if s.lastRetain == nil {
+			s.lastRetain = map[string]time.Time{}
+		}
+		s.lastRetain[app] = time.Now()
+	}
+	s.stateMu.Unlock()
+	if !due {
+		return
+	}
 	if err := s.retain(ctx, cl, app, s.retention()); err != nil {
 		s.Log.Warn("backup retention", "app", app, "err", err)
 	}
@@ -512,7 +601,8 @@ func (s *Service) pruneLocal(app string) {
 		return
 	}
 	cutoff := time.Now().Add(-s.retention()).Unix()
-	n := 0
+	n, pendingN := 0, 0
+	hours := map[int64]bool{} // UTC hours with a kept not-uploaded copy
 	for rows.Next() {
 		var path, key string
 		var created int64
@@ -520,8 +610,19 @@ func (s *Service) pruneLocal(app string) {
 			continue
 		}
 		n++
-		if n <= KeepLocal || (s3ok && key == "" && created > cutoff) {
+		if n <= KeepLocal {
 			keep[path] = true
+		}
+		if !s3ok || key != "" || created <= cutoff {
+			continue
+		}
+		// Not uploaded yet: kept for the upload retry, the newest few
+		// and then one per hour, so an outage of the bucket doesn't fill
+		// the disk with 288 copies per app.
+		pendingN++
+		if hour := created / 3600; pendingN <= KeepUnuploaded || !hours[hour] {
+			keep[path] = true
+			hours[hour] = true
 		}
 	}
 	rows.Close()
@@ -572,7 +673,8 @@ func (s *Service) DeleteAll(ctx context.Context, app string) error {
 // nextSlot is the next multiple of every (UTC) after t.
 func nextSlot(t time.Time, every time.Duration) time.Time { return t.UTC().Truncate(every).Add(every) }
 
-// Schedule runs the 3-hourly app backups until ctx ends.
+// Schedule runs the scheduled app backups (every Interval, aligned to UTC)
+// until ctx ends.
 func (s *Service) Schedule(ctx context.Context) {
 	go func() {
 		s.UploadPending(ctx)
@@ -586,6 +688,18 @@ func (s *Service) Schedule(ctx context.Context) {
 			}
 			s.RunAll(ctx, KindScheduled)
 			s.UploadPending(ctx)
+			// Slots that passed while this run was going are skipped.
+			if missed := int(time.Since(next) / s.interval()); missed > 0 {
+				s.stateMu.Lock()
+				for i := 0; i < missed; i++ {
+					s.skipped = append(s.skipped, time.Now())
+				}
+				for len(s.skipped) > 0 && time.Since(s.skipped[0]) > 24*time.Hour {
+					s.skipped = s.skipped[1:]
+				}
+				s.stateMu.Unlock()
+				s.Log.Warn("a backup run took longer than the interval; slots were skipped", "skipped", missed, "took", time.Since(next).Round(time.Second))
+			}
 		}
 	}()
 }
@@ -596,7 +710,7 @@ func (s *Service) RunAll(ctx context.Context, kind string) {
 		if ctx.Err() != nil {
 			return
 		}
-		if _, err := s.Run(ctx, app, kind, true, nil); err != nil && !errors.Is(err, ErrNoDatabases) {
+		if _, err := s.Run(ctx, app, kind, true, nil); err != nil && !errors.Is(err, ErrNoDatabases) && !errors.Is(err, ErrUnchanged) {
 			s.Log.Warn("scheduled backup failed", "app", app, "err", err)
 		}
 	}
