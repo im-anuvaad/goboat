@@ -70,12 +70,17 @@ Behaviour stays as it is (release-based deploys still work), so the rename can b
 - Not seen live: a skipped slot (a run longer than 10 minutes needs very large databases); the counting and the warning are in the code but not exercised on the VPS.
 - Also fixed: a data race in the phase 4 edge test helper that failed the release workflow once.
 
-## Phase 6: server move
+## Phase 6: server move (done)
 
 - `move` package: code, HKDF-derived token and key, encrypted bundle and file transfer, `/move/v1/*` endpoints, configuration freeze, incoming and moved modes.
 - `install.sh move <url> <code>` and `goboat move-in`.
 - Old dashboard: Start, progress, Cancel, **Switch now**, moved page.
 - Done when: a VPS 1 install with 2 apps (one with uploads in `DATA_DIR`) moves to VPS 2; measured downtime per app is recorded in architecture §12; after the move the zone has the same Origin CA and AOP certs as before; VPS 1 stays in moved mode after a reboot; a move cancelled at step 4 and one that fails at step 7 both leave VPS 1 serving as before.
+- Result: five real moves between VPS 1 and VPS 2 with two apps (`hello`: SQLite + a file per visit; `broken`: no data); the final version (`v0.0.6-rc6`) moved VPS 2 → VPS 1 with 1.3–1.6 s of 503s seen from outside, every visit and upload file arrived, the zone kept exactly the same 3 Origin CA certificates and 1 AOP certificate, the DNS records point at the new server, the retired server stayed retired after a reboot and passed connections on without errors.
+- Found and fixed on the way (each one a real move):
+  - rc1/rc2: for about two minutes after the switch half the requests reached the old server's "moving" page (Cloudflare's edge kept connecting to the old origin) → the retired server passes connections on to the new one for 30 minutes; it also closes keep-alive and idle connections.
+  - rc5: the old server cut off its own answer to `done` while retiring; the new server took that as a failure and deleted everything → `done` is answered before retiring, a lost answer is checked, and after the switch nothing is deleted unless the old server confirms it serves again. Recovered by hand on the test servers.
+- Cancel at "ready": the old server unfroze and kept serving; the new server removed everything and restarted empty. A failure at step 7 (health check) is covered by the unit test against a real HTTP server; not provoked on the VPS.
 
 ## Phase 7: release
 

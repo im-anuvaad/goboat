@@ -263,30 +263,35 @@ Every 10 s: host (`/proc/stat`, `/proc/meminfo` including swap, `/proc/loadavg`,
 Moves a **working** installation to a new server: all settings, the account, apps, env vars, certificates and the AOP CA, and the apps' latest data. The old server keeps serving until the user switches (D27).
 
 ### 10.1 What the user does
-1. Old dashboard: **Settings → Move to another server → Start**. It shows a command with a one-time **move code**, valid 1 hour:
-   `curl -fsSL https://github.com/im-anuvaad/goboat/releases/latest/download/install.sh | sudo bash -s -- move https://<dashboard domain> <code>`
-2. Run it on the new server. The old dashboard shows each step: connected, settings copied, each app building, ready.
-3. Press **Switch now**. The page follows the switch and then links to the dashboard domain, now served by the new server.
+1. Old dashboard: **Settings → Move to another server**, enter the password, **Create move code**. The page shows a command with a one-time **move code** (128 bits, valid 1 hour) that installs the **same goboat version** as the old server:
+   `curl -fsSL https://github.com/im-anuvaad/goboat/releases/download/<version>/install.sh | sudo GOBOAT_VERSION=<version> bash -s -- move https://<dashboard domain> <code>`
+2. Run it on the new server (fresh Ubuntu, same requirements as an install). The old dashboard shows each step: connected, settings copied, each app built, data copied, ready.
+3. Press **Switch now**. A few seconds later everything is served by the new server; the old one says it was moved.
 
 ### 10.2 Protocol
-The old server serves `/move/v1/*` on its dashboard domain (through Cloudflare, so the IP filter and AOP stay as they are). The new server is an HTTPS client of that URL. From the code, both derive with HKDF-SHA256 an **auth token** (sent as `Authorization: Bearer`) and an **encryption key** (never sent); every payload is AES-256-GCM-encrypted with that key, so Cloudflare, which terminates TLS, can't read it. The old server keeps the code sealed in `move_state`; wrong tokens count towards the sign-in rate limit; the code expires after 1 hour unless a move is in progress, and one move runs at a time.
+The old server serves `/move/v1/*` on its dashboard domain, through Cloudflare (IP filter and AOP as for the dashboard; refused on the setup address). From the code both servers derive, with HKDF-SHA256, an **auth token** (sent as `Authorization: Bearer`) and an **encryption key** (never sent). Every request and response body is AES-256-GCM-encrypted in 1 MB frames whose additional data binds each frame to its purpose (`bundle`, `files:<app>:final` …), its position and whether it is the last, so Cloudflare, which terminates TLS, can neither read nor change, reorder or cut off anything unnoticed. Wrong tokens count towards the sign-in rate limit. The old server keeps the move sealed in the `move_state` setting; one move runs at a time.
 
 | Step | New server | Old server |
 |---|---|---|
-| 1 | `install.sh move <url> <code>`: installs goboat, Go and swap as usual (§4); `goboat move-in` checks the new server is empty | |
-| 2 | `GET /move/v1/hello`: versions must match, else it stops: "update the old server first: run the install command there" | **Freezes configuration**: settings, apps, env vars and limits can't be changed until the move ends or is cancelled. Apps keep running, deploys are refused |
-| 3 | `GET /move/v1/bundle`: `goboat.db` snapshot (without sessions, setup password, metrics; backup rows keep only bucket copies), `master.key`, `aop/`, `certs/`. Installed while goboat is stopped; goboat starts in **incoming** mode: no edge sync, no backups, no apps started, setup address closed | Logs the copy |
-| 4 | Builds every app at the commit the old server runs (`GET /move/v1/apps`), reporting progress (`POST /move/v1/progress`). Meanwhile it **pre-copies each app's whole `DATA_DIR`** (`GET /move/v1/files/<app>`: a file list with size, mtime, SHA-256, then the files; databases as consistent `VACUUM INTO` snapshots). A failed build stops the move here | Shows progress; **Cancel** possible |
-| 5 | Waits (`GET /move/v1/switch`, long poll) | User presses **Switch now** |
-| 6 | | Router: every app 503 "moving"; stops apps; stops scheduled backups |
-| 7 | Asks for the file list again and fetches only files that are new or changed since the pre-copy (with the apps stopped, the files are final), deletes files that are gone, runs `quick_check` on every database, starts apps, waits for health checks | Serves the changed files |
-| 8 | Leaves incoming mode: edge sync points every DNS record (apps and dashboard domain) at the new server; Cloudflare objects are reused unchanged (same Origin CA certs, same AOP cert, so no 10-minute rollout). Backups start. `POST /move/v1/done` | Records `moved_to` = new IP and time, enters **moved** mode |
+| 1 | `install.sh move <url> <code>` → `goboat move-in`: refuses a server with apps or an account, prepares the host as an install does (§4) | |
+| 2 | `GET hello`: versions must match | **Freezes configuration**: every change in the dashboard is refused until the move ends; apps keep running |
+| 3 | `GET bundle`: a snapshot of `goboat.db` without sessions, the one-time password, metrics, kept builds and local backup copies; `master.key`; `aop/`; `certs/`. Installed while goboat is stopped; the move is saved (sealed) as `move_incoming`, then goboat starts in **incoming** mode: no Cloudflare sync, no backups, no app starts | |
+| 4 | Accepts connections from the old server's addresses (step 8). Builds every app at the commit the old server runs (`deployer.Prepare`: built and made current, not started; recorded as a deployment of kind `move`) and **pre-copies each app's whole `DATA_DIR`** (`POST files/<app>` with the files it already has: the answer is a tar of every database as a `VACUUM INTO` snapshot plus every other file whose size or mtime differs, with a manifest of all files) | Shows progress; **Cancel** possible |
+| 5 | `GET switch` (long poll, 45 s, under Cloudflare's 100 s limit) | User presses **Switch now** |
+| 6 | | Pauses its Cloudflare syncs, router: every app 503 "moving", waits for a running backup, stops the apps (they stay *desired running*) |
+| 7 | Final `files/<app>` pass: only what changed since the pre-copy plus the databases; files gone on the old server are deleted. Starts the apps that were running, each must pass its health check | |
+| 8 | `POST done` with its addresses | Answers, then (2 s later) **retires**: `moved_to` saved, Cloudflare syncs paused for good, keep-alive connections closed, and for 30 minutes every new connection is passed on as raw TCP to the new server |
+| 9 | Leaves incoming mode: Cloudflare sync points every DNS record at itself (an AAAA record is deleted if it has no IPv6), backups start | |
 
-- **Downtime** is steps 6–8: stopping the apps, sending the files that changed since the pre-copy (usually just the databases), starting the apps and the DNS update (proxied records change at Cloudflare within seconds). For apps with databases of a few MB this is well under a minute.
-- **Failure before step 8**: the new server reports the error (`POST /move/v1/failed`); the old server restarts its apps, unfreezes, and shows the error; the user can retry with a new code. The new server deletes everything it received.
-- **Moved mode** (old server, persists across restarts and re-installs): no apps, no backups, no edge sync, no cleanup; the dashboard domain and setup address show only "This server was moved to <IP> on <date>. You can delete it." Nothing on the old server writes to the bucket or Cloudflare any more, so the two servers never compete.
+- **Reused at Cloudflare:** the Origin CA certificates and the AOP certificate are the same, so nothing is issued or uploaded and there is no 10-minute AOP rollout; the first sync only updates the DNS records.
+- **Why the old server passes connections on:** Cloudflare's edge keeps using its existing connections, and resolves the origin anew only over a minute or two after a DNS change. Without step 8's forwarding, about half the requests in the first two minutes got the old server's "moving" page (measured). TLS stays end to end between Cloudflare and the new server, which has the same certificates and AOP CA.
+- **Downtime** is steps 6–9. Measured between two 2 vCPU / 2 GB VPSes in the same region with two small apps: the apps answered 503 for 1.3–1.6 s seen from outside through Cloudflare (probes every 0.25 s); the new server's log shows 0.6 s from the final copy to the old server retiring. Each app took 28–44 s to build on the new server before that, while the old one kept serving.
+- **Failure before the switch** (build error, wrong version, cancel): the new server tells the old one (`POST failed`), which unfreezes; the new server removes everything it received (database, `master.key`, `aop/`, `certs/`, apps and their users) and goboat restarts empty. Re-running the install command retries.
+- **Failure after the switch:** the old server restarts its apps only when told so (`POST failed`, or **Cancel**). The new server deletes nothing unless the old server confirmed; otherwise it keeps everything and goboat restarts and continues the move. A lost answer to `done` is checked by asking the old server. (An earlier version deleted what it had received when the answer to `done` was cut off, leaving neither server with the apps; found in testing and fixed before release.)
+- **goboat restarting on the old server mid-move** ends the move as failed; the apps start there as usual.
+- **Moved mode** (old server, persists across restarts, reboots and re-installs): no apps, no backups, no Cloudflare syncs or cleanup; every dashboard page says where the installation went and that the server can be deleted. Nothing on it writes to the bucket or Cloudflare any more, so the two servers never compete.
+- Moved: everything in each app's `DATA_DIR`, not only its databases (symlinks and special files are skipped). Not moved: logs, metrics, deploy history of builds (the builds of the current commits are new), local backup copies (the bucket copies stay usable).
 - Builds are redone on the new server, so it may have a different CPU architecture.
-- Moved: everything in each app's `DATA_DIR`, not only its databases. Not moved: logs, metrics, deploy history (the builds of the current commits are new), local backup copies (the bucket copies stay usable). The Start page says so.
 
 ## 11. Dashboard and security
 
@@ -310,7 +315,7 @@ The old server serves `/move/v1/*` on its dashboard domain (through Cloudflare, 
 | Rebuild of a small app after a one-line change (warm caches) | < 20 s (measured: 1.2 s build, 2.8 s deploy) |
 | First build of a small app (cold caches) | < 2 min (measured: 63 s with SQLite) |
 | Deploy downtime (switch only) | < 1 s plus the app's start |
-| Server move downtime (small databases) | < 1 min |
+| Server move downtime (small databases) | < 1 min (measured: 1.3–1.6 s) |
 | Reboot to serving | seconds |
 
 ## 13. Changing goboat
@@ -350,7 +355,7 @@ The old server serves `/move/v1/*` on its dashboard domain (through Cloudflare, 
 | D24 | **Track every Cloudflare object until deleted**; reconcile served zones against Cloudflare's lists; goboat owns zone-level AOP in its zones | failed or interrupted deletes, crashes and reinstalls had left piles of certs |
 | D25 | **Backups every 10 min**, skipped when unchanged, 48 h retention | an RPO of 3 h lost real data; skipping keeps cost and bucket clutter down |
 | D26 | Change detection by file size + mtime of the DB and its WAL | cheap, no SQLite internals; any write changes one of them |
-| D27 | **Server move by direct transfer** from the old server, encrypted with a key derived from the move code; old server fenced in moved mode | one command + one click for the user; certs and AOP reused, so no Cloudflare waits; never two servers writing to the bucket |
+| D27 | **Server move by direct transfer** from the old server, encrypted with a key derived from the move code; old server fenced in moved mode and passing connections on for 30 minutes | one command + one click for the user; certs and AOP reused, so no Cloudflare waits; never two servers writing to the bucket; Cloudflare's edge follows a DNS change only over a minute or two |
 | D28 | Source archives instead of `git clone` | no git credentials or history on the server; reuses the safe unpacker; same token as the API |
 | D29 | Go toolchain owned by goboat in `/usr/local/lib/goboat/go`, `GOTOOLCHAIN=auto` | never clashes with a system Go; apps can require newer Go via `go.mod` |
 | D30 | A read-only status API with one rotatable bearer token | agents and scripts can answer "is it up?" without a browser; read-only keeps the dashboard the only way to change things |
