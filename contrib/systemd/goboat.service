@@ -1,0 +1,26 @@
+[Unit]
+Description=goboat - minimal PaaS for small Go + SQLite web apps
+Documentation=https://github.com/im-anuvaad/goboat
+After=network-online.target
+Wants=network-online.target
+# Never give up restarting; the delay grows to at most 60s.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/goboat serve
+Restart=always
+RestartSec=2s
+RestartSteps=5
+RestartMaxDelaySec=60s
+# goboat owns its cgroup subtree (supervisor/, apps/<app>/, builds/<app>/).
+Delegate=yes
+# SIGTERM goes to goboat only, so it can stop apps gracefully in order (and
+# not mistake them for crashes). Anything left after the timeout is SIGKILLed.
+KillMode=mixed
+# goboat forwards SIGTERM to apps and waits up to 10s each; leave headroom.
+TimeoutStopSec=45s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
