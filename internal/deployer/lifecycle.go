@@ -67,10 +67,10 @@ func (d *Deployer) Unregister(name string) error {
 	return nil
 }
 
-// Forget deletes an app's releases, deployments and desired state rows.
+// Forget deletes an app's builds, deployments and desired state rows.
 func (d *Deployer) Forget(ctx context.Context, name string) error {
 	for _, q := range []string{
-		`DELETE FROM releases WHERE app = ?`,
+		`DELETE FROM builds WHERE app = ?`,
 		`DELETE FROM deployments WHERE app = ?`,
 		`DELETE FROM app_state WHERE app = ?`,
 	} {
@@ -88,12 +88,12 @@ func (d *Deployer) apply(ctx context.Context, name string, a *supervisor.App) er
 		return nil // prebuilt dev app: nothing to apply
 	}
 	spec := cfg.Base
-	if cur := d.currentRelease(name); cur != "" {
-		rel, err := d.release(ctx, name, cur)
+	if cur := d.currentBuild(name); cur != "" {
+		b, err := d.build(ctx, name, cur)
 		if err != nil {
 			return err
 		}
-		spec = d.specFor(cfg, rel)
+		spec = d.specFor(cfg, b)
 	}
 	return a.Update(ctx, spec)
 }
@@ -114,7 +114,7 @@ func (d *Deployer) Start(ctx context.Context, name string) error {
 		}
 	}
 	if err := a.Start(ctx); err != nil {
-		if errors.Is(err, supervisor.ErrNoRelease) {
+		if errors.Is(err, supervisor.ErrNotDeployed) {
 			return err
 		}
 		d.SetDesired(ctx, name, true)
@@ -188,7 +188,7 @@ func (d *Deployer) NeedsRestart(name string) bool {
 	return !maps.Equal(sp.Env, cfg.Base.Env) || sp.Limits != cfg.Base.Limits || sp.Domain != cfg.Base.Domain
 }
 
-// PurgeFiles removes an app's releases, logs and download workspaces.
+// PurgeFiles removes an app's builds and logs.
 // If keepData is false DATA_DIR is removed too; otherwise it is moved to
 // <root>/deleted/<app>-<unix>/data and its path returned.
 func (d *Deployer) PurgeFiles(name string, keepData bool, stamp int64) (string, error) {
@@ -214,7 +214,7 @@ func (d *Deployer) PurgeFiles(name string, keepData bool, stamp int64) (string, 
 		}
 	}
 	var errs []error
-	for _, p := range []string{d.Layout.AppDir(name), d.Layout.DownloadsDir(name)} {
+	for _, p := range []string{d.Layout.AppDir(name), filepath.Join(d.Layout.WorkRoot(), name)} {
 		if err := os.RemoveAll(p); err != nil {
 			errs = append(errs, err)
 		}

@@ -1,4 +1,4 @@
-package artifact
+package source
 
 import (
 	"archive/tar"
@@ -33,12 +33,14 @@ func parseEntries(spec string) []tarEntry {
 	return es
 }
 
-func writeTarGz(t testing.TB, path string, es []tarEntry) {
+func writeTarGz(t testing.TB, path string, es []tarEntry) { writeTarGzPrefix(t, path, "./", es) }
+
+func writeTarGzPrefix(t testing.TB, path, prefix string, es []tarEntry) {
 	var buf bytes.Buffer
 	zw := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(zw)
 	for _, e := range es {
-		h := &tar.Header{Name: "./" + e.name, Mode: 0o755}
+		h := &tar.Header{Name: prefix + e.name, Mode: 0o755}
 		switch e.typ {
 		case 'd':
 			h.Typeflag = tar.TypeDir
@@ -70,7 +72,7 @@ func unpack(t testing.TB, es []tarEntry) (string, error) {
 	archive := filepath.Join(root, "app.tar.gz")
 	writeTarGz(t, archive, es)
 	dst := filepath.Join(deep, "dst")
-	err := Unpack(archive, dst, MaxUnpacked)
+	err := Unpack(archive, dst, Limits{MaxBytes: 1 << 20, MaxEntries: 100})
 	want := map[string][]string{root: {"a", "app.tar.gz"}, filepath.Join(root, "a"): {"b"},
 		filepath.Join(root, "a", "b"): {"c"}, deep: {"dst"}}
 	for dir, names := range want {
@@ -122,12 +124,46 @@ func TestUnpackLimits(t *testing.T) {
 	dir := t.TempDir()
 	a := filepath.Join(dir, "a.tar.gz")
 	writeTarGz(t, a, parseEntries("f a\nf b"))
-	if err := Unpack(a, filepath.Join(dir, "d"), 3); err == nil || !strings.Contains(err.Error(), "expands to more than") {
+	if err := Unpack(a, filepath.Join(dir, "d"), Limits{MaxBytes: 3, MaxEntries: 10}); err == nil || !strings.Contains(err.Error(), "expands to more than") {
 		t.Fatalf("size limit: %v", err)
 	}
+	if err := Unpack(a, filepath.Join(dir, "d2"), Limits{MaxBytes: 1 << 20, MaxEntries: 1}); err == nil || !strings.Contains(err.Error(), "more than 1 entries") {
+		t.Fatalf("entry limit: %v", err)
+	}
 	os.WriteFile(filepath.Join(dir, "plain"), []byte("not gzip"), 0o600)
-	if err := Unpack(filepath.Join(dir, "plain"), filepath.Join(dir, "e"), MaxUnpacked); err == nil {
+	if err := Unpack(filepath.Join(dir, "plain"), filepath.Join(dir, "e"), SourceLimits); err == nil {
 		t.Fatal("non-gzip accepted")
+	}
+}
+
+// GitHub's tarballs put everything in "<owner>-<repo>-<sha>/"; StripTop
+// removes it and refuses entries outside it.
+func TestUnpackStripTop(t *testing.T) {
+	dir := t.TempDir()
+	a := filepath.Join(dir, "a.tar.gz")
+	writeTarGzPrefix(t, a, "me-web-3f9c2a1/", parseEntries("d cmd\nf cmd/main.go\nf goboat.toml"))
+	dst := filepath.Join(dir, "src")
+	if err := Unpack(a, dst, SourceLimits); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"cmd/main.go", "goboat.toml"} {
+		if _, err := os.Stat(filepath.Join(dst, p)); err != nil {
+			t.Errorf("%s: %v", p, err)
+		}
+	}
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(zw)
+	for _, n := range []string{"top/a", "other/b"} {
+		tw.WriteHeader(&tar.Header{Name: n, Mode: 0o644, Typeflag: tar.TypeReg, Size: 1})
+		tw.Write([]byte("x"))
+	}
+	tw.Close()
+	zw.Close()
+	b := filepath.Join(dir, "b.tar.gz")
+	os.WriteFile(b, buf.Bytes(), 0o600)
+	if err := Unpack(b, filepath.Join(dir, "src2"), SourceLimits); err == nil || !strings.Contains(err.Error(), "must be inside top/") {
+		t.Fatalf("two top-level dirs: %v", err)
 	}
 }
 
@@ -151,20 +187,6 @@ func FuzzUnpack(f *testing.F) {
 	})
 }
 
-func TestChecksum(t *testing.T) {
-	sums := []byte("0f833f23eb1e8d899fe057240446b8ddb946fd3a375059bebec9864b868e6dcd  app-linux-arm64.tar.gz\n" +
-		"A8F5B15B413FA1645E527A8989C5586A7A88E529C10B2A1C295C3BFC43355750 *app-linux-amd64.tar.gz\n")
-	if s, err := Checksum(sums, "app-linux-amd64.tar.gz"); err != nil || s != "a8f5b15b413fa1645e527a8989c5586a7a88e529c10b2a1c295c3bfc43355750" {
-		t.Fatalf("%q %v", s, err)
-	}
-	if _, err := Checksum(sums, "app-linux-riscv.tar.gz"); err == nil {
-		t.Fatal("missing line accepted")
-	}
-	if _, err := Checksum([]byte("zz  app-linux-amd64.tar.gz"), "app-linux-amd64.tar.gz"); err == nil {
-		t.Fatal("bad hash accepted")
-	}
-}
-
 func TestCheckBinary(t *testing.T) {
 	root := t.TempDir()
 	self, err := os.Executable() // the test binary: an ELF for this machine
@@ -175,21 +197,21 @@ func TestCheckBinary(t *testing.T) {
 	os.WriteFile(filepath.Join(root, "app"), b, 0o755)
 	os.WriteFile(filepath.Join(root, "noexec"), b, 0o644)
 	os.WriteFile(filepath.Join(root, "script"), []byte("#!/bin/sh\n"), 0o755)
-	os.Symlink("/bin/sh", filepath.Join(root, "outside"))
-	if err := CheckBinary(root, "app", runtime.GOARCH); err != nil {
+	os.Symlink("/bin/sh", filepath.Join(root, "link"))
+	if err := CheckBinary(filepath.Join(root, "app"), runtime.GOARCH); err != nil {
 		t.Fatal(err)
 	}
 	other := "arm64"
 	if runtime.GOARCH == "arm64" {
 		other = "amd64"
 	}
-	for rel, want := range map[string]string{"missing": "not in the release", "noexec": "not executable",
-		"script": "not a Linux (ELF) binary", "outside": "points outside"} {
-		if err := CheckBinary(root, rel, runtime.GOARCH); err == nil || !strings.Contains(err.Error(), want) {
+	for rel, want := range map[string]string{"missing": "no binary", "noexec": "not executable",
+		"script": "not a Linux (ELF) binary", "link": "not a regular file"} {
+		if err := CheckBinary(filepath.Join(root, rel), runtime.GOARCH); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("%s: %v (want %q)", rel, err, want)
 		}
 	}
-	if err := CheckBinary(root, "app", other); err == nil || !strings.Contains(err.Error(), "but this server is "+other) {
+	if err := CheckBinary(filepath.Join(root, "app"), other); err == nil || !strings.Contains(err.Error(), "but this server is "+other) {
 		t.Errorf("wrong arch: %v", err)
 	}
 }

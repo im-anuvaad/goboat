@@ -21,8 +21,8 @@
   <dl class="facts">
     <dt>Domain</dt><dd>{{if .Domain}}<a href="https://{{.Domain}}/" target="_blank" rel="noopener">{{.Domain}}</a>{{else}}-{{end}}
       {{with $.Data.EdgeHost}}<small class="muted">· DNS {{.DNS}} · certificate until {{date .CertUntil}}</small>{{if .Error}}<br><span class="error-text">{{.Error}}</span>{{end}}{{end}}</dd>
-    <dt>Release</dt><dd>{{if .Status.Release}}<code>{{.Status.Release}}</code>{{else}}<span class="muted">not deployed yet</span>{{end}}</dd>
-    <dt>Repository</dt><dd><a href="{{.Repo}}/releases" target="_blank" rel="noopener">{{.Repo}}</a></dd>
+    <dt>Running</dt><dd>{{if .Status.Commit}}commit <a href="{{.Repo}}/commit/{{.Status.Commit}}" target="_blank" rel="noopener"><code>{{short .Status.Commit}}</code></a> of {{.Status.Branch}}{{else}}<span class="muted">not deployed yet</span>{{end}}</dd>
+    <dt>Repository</dt><dd><a href="{{.Repo}}/tree/{{.Branch}}" target="_blank" rel="noopener">{{.Repo}}</a> · branch <code>{{.Branch}}</code></dd>
     <dt>Process</dt><dd>{{if .Status.PID}}pid {{.Status.PID}}, healthy {{ago .Status.HealthyAt}} · {{else}}not running · {{end}}port {{.Port}}</dd>
     <dt>Usage</dt><dd>{{if .MemBytes}}{{bytes .MemBytes}} of {{bytes .Limits.MemoryMax}} memory · {{end}}{{.Requests}} requests{{if .Requests5xx}} ({{.Requests5xx}} 5xx){{end}}</dd>
     <dt>Restarts</dt><dd>{{.Status.Restarts}}{{if .Status.OOMKills}} · <span class="error-text">{{.Status.OOMKills}} out-of-memory kills</span>{{end}}{{with .Status.LastExit}} · last exit: {{.}}{{end}}</dd>
@@ -32,20 +32,20 @@
 
 <section class="card" id="deploy">
   <h2>Deploy</h2>
-  {{with $.Data.GitHubReleases}}
+  {{with $.Data.Commits}}
   <form method="post" action="/apps/{{$.Data.App.Name}}/deploy" class="row-form">
     {{template "csrf" $csrf}}
-    <label>Release
-      <select name="tag">{{range $i, $r := .}}
-        <option value="{{$r.Tag}}" {{if eq $i 0}}selected{{end}}>{{$r.Tag}}{{if and $r.Name (ne $r.Name $r.Tag)}} — {{$r.Name}}{{end}}{{if eq $i 0}} (latest){{end}}{{if $r.Prerelease}} (pre-release){{end}} · {{date $r.PublishedAt}}</option>{{end}}
+    <label>Commit of {{$.Data.Branch}}
+      <select name="sha">{{range $i, $c := .}}
+        <option value="{{$c.SHA}}" {{if eq $i 0}}selected{{end}}>{{$c.Short}} · {{$c.Subject}}{{if eq $i 0}} (newest){{end}}{{if eq $c.SHA $.Data.App.Status.Commit}} (running){{end}} · {{$c.Author}}, {{ago $c.Date}}</option>{{end}}
       </select>
     </label>
     <button class="primary" {{if $.Data.App.Pending}}disabled{{end}}>Deploy</button>
   </form>
-  <p class="muted">The 10 newest GitHub releases of {{$.Data.App.Repo}}. The chosen release is downloaded, checked against its checksums.txt and started; if it doesn't become healthy, the current one keeps running.</p>
+  <p class="muted">The 10 newest commits of <code>{{$.Data.Branch}}</code>. goboat downloads the chosen commit, builds it on this server and starts it; the running version keeps serving during the build, and stays if the new one doesn't build or doesn't become healthy.</p>
   {{else}}
-  {{with $.Data.GitHubErr}}<p class="error">Could not list the releases: {{.}}</p>{{else}}
-  <p class="muted">The repository has no releases yet. Add the release workflow (<a href="https://github.com/im-anuvaad/goboat/blob/main/docs/app-contract.md#22-the-release-workflow" target="_blank" rel="noopener">app contract §2</a>) and push a tag: <code>git tag v1.0.0 &amp;&amp; git push origin v1.0.0</code>. The release shows up here a few minutes later.</p>{{end}}
+  {{with $.Data.GitHubErr}}<p class="error">Could not list the commits: {{.}}</p>{{else}}
+  <p class="muted">The branch has no commits yet. Push one, then reload this page.</p>{{end}}
   {{end}}
 </section>
 
@@ -57,32 +57,33 @@
 
 
 <section class="card">
-  <h2>Kept releases</h2>
-  {{with $.Data.Releases}}
+  <h2>Kept builds</h2>
+  {{with $.Data.Builds}}
   <table class="stack">
-    <thead><tr><th>Release</th><th>Name</th><th>SHA-256</th><th>Deployed</th><th></th></tr></thead>
+    <thead><tr><th>Commit</th><th>Message</th><th>Branch</th><th>Go</th><th>Built</th><th></th></tr></thead>
     <tbody>{{range .}}
     <tr>
-      <td class="nowrap" data-label="Release"><code>{{.ID}}</code>{{if .Current}} <span class="badge s-running">current</span>{{end}}</td>
-      <td data-label="Name">{{if ne .Subject .ID}}{{.Subject}}{{end}}</td>
-      <td data-label="SHA-256"><code>{{short .SHA256}}</code></td>
-      <td data-label="Deployed">{{ago .CreatedAt}}</td>
-      <td class="end">{{if not .Current}}<form method="post" action="/apps/{{.App}}/rollback" class="inline" data-confirm="Switch to release {{.ID}}?">{{template "csrf" $csrf}}<input type="hidden" name="release" value="{{.ID}}"><button>Roll back</button></form>{{end}}</td>
+      <td class="nowrap" data-label="Commit"><code>{{.Short}}</code>{{if .Current}} <span class="badge s-running">current</span>{{end}}</td>
+      <td class="clip" data-label="Message">{{.Subject}}</td>
+      <td data-label="Branch"><code>{{.Branch}}</code></td>
+      <td data-label="Go">{{.GoVersion}}</td>
+      <td data-label="Built">{{ago .CreatedAt}}{{if .BuildTime}} <small class="muted">in {{.BuildTime.Round 1000000000}}</small>{{end}}</td>
+      <td class="end">{{if not .Current}}<form method="post" action="/apps/{{.App}}/rollback" class="inline" data-confirm="Switch to the build of {{.Short}}? It is not rebuilt.">{{template "csrf" $csrf}}<input type="hidden" name="build" value="{{.ID}}"><button>Roll back</button></form>{{end}}</td>
     </tr>{{end}}
     </tbody>
   </table>
-  {{else}}<p class="muted">None yet. The last 3 deployed releases are kept on the server for instant rollback.</p>{{end}}
+  {{else}}<p class="muted">None yet. The last 3 builds are kept on the server, so rolling back needs no rebuild.</p>{{end}}
 </section>
 
 <section class="card">
   <h2>Deployments</h2>
   {{with $.Data.Deployments}}
   <table class="stack">
-    <thead><tr><th>#</th><th>Kind</th><th>Status</th><th>Release</th><th>Started</th><th>Took</th><th>Error</th></tr></thead>
+    <thead><tr><th>#</th><th>Kind</th><th>Status</th><th>Commit</th><th>Started</th><th>Took</th><th>Error</th></tr></thead>
     <tbody>{{range .}}
     <tr>
       <td data-label="#"><a href="/deployments/{{.ID}}">#{{.ID}}</a></td><td data-label="Kind">{{.Kind}}</td><td data-label="Status">{{template "state" .Status}}</td>
-      <td data-label="Release">{{if .ReleaseID}}<code>{{.ReleaseID}}</code>{{else}}<span class="muted">-</span>{{end}}</td><td data-label="Started">{{ago .StartedAt}}</td><td data-label="Took">{{dur .StartedAt .FinishedAt}}</td>
+      <td data-label="Commit">{{if .GitSHA}}<code>{{short .GitSHA}}</code>{{else}}<span class="muted">-</span>{{end}}</td><td data-label="Started">{{ago .StartedAt}}</td><td data-label="Took">{{dur .StartedAt .FinishedAt}}</td>
       <td class="clip" data-label="Error">{{.Error}}</td>
     </tr>{{end}}
     </tbody>
@@ -99,14 +100,14 @@
   <p class="muted">SQLite files in DATA_DIR are backed up {{$.Data.Policy}} (the newest is always kept), to the bucket folder <code>{{.Name}}/</code>. The last 2 are also kept on this server.{{if not $.Data.S3Set}} <b>No bucket is configured</b>, so they are only on this server.{{end}}</p>
   {{with $.Data.Backups}}
   <table class="stack">
-    <thead><tr><th>#</th><th>Taken</th><th>Kind</th><th>Status</th><th>Size</th><th>Where</th><th>Release</th><th></th></tr></thead>
+    <thead><tr><th>#</th><th>Taken</th><th>Kind</th><th>Status</th><th>Size</th><th>Where</th><th>Commit</th><th></th></tr></thead>
     <tbody>{{range .}}
     <tr>
       <td data-label="#">#{{.ID}}</td><td class="nowrap" data-label="Taken">{{datetime .CreatedAt}} <small class="muted">{{ago .CreatedAt}}</small></td><td data-label="Kind">{{.Kind}}</td>
       <td data-label="Status">{{if eq .Status "ok"}}<span class="badge s-running">ok</span>{{else}}{{template "state" .Status}}{{end}}{{with .Error}} <small class="error-text">{{.}}</small>{{end}}</td>
       <td data-label="Size">{{bytes .Size}}</td>
       <td data-label="Where">{{if .Uploaded}}bucket{{end}}{{if and .Uploaded .LocalPath}} + {{end}}{{if .LocalPath}}server{{end}}</td>
-      <td data-label="Release">{{if .ReleaseID}}<code>{{.ReleaseID}}</code>{{else}}<span class="muted">-</span>{{end}}</td>
+      <td data-label="Commit">{{if .GitSHA}}<code>{{short .GitSHA}}</code>{{else}}<span class="muted">-</span>{{end}}</td>
       <td class="end">{{if .Restorable}}<form method="post" action="/apps/{{$.Data.App.Name}}/restore" class="inline" data-confirm="Restore backup #{{.ID}} from {{datetime .CreatedAt}}? The app is stopped briefly; its current databases are moved to a .pre-restore folder.">{{template "csrf" $csrf}}<input type="hidden" name="id" value="{{.ID}}"><button>Restore</button></form>{{end}}</td>
     </tr>{{end}}
     </tbody>
@@ -136,7 +137,8 @@
   {{with $.Data.Edit}}
   <form method="post" action="/apps/{{$.Data.App.Name}}/settings" class="grid">
     {{template "csrf" $csrf}}
-    <label class="wide">GitHub repository <input name="repo" value="{{.Repo}}" required><small>Must keep the name {{$.Data.App.Name}} (the app is named after it)</small></label>
+    <label class="wide">GitHub repository <input name="repo" value="{{.Repo}}" required data-branches="settings-branches"><small>Must keep the name {{$.Data.App.Name}} (the app is named after it)</small></label>
+    <label class="wide">Branch <input name="branch" value="{{.Branch}}" required list="settings-branches" autocomplete="off"><datalist id="settings-branches"></datalist><small>Deploys build from this branch; a change applies on the next deploy</small></label>
     <label class="wide">Domain <input name="domain" value="{{.Domain}}" placeholder="(none)"></label>
     <fieldset class="wide">
       <legend>Limits</legend>
@@ -151,7 +153,7 @@
 
 <section class="card danger" id="danger">
   <h2>Delete app</h2>
-  <p>Stops the app and removes its releases, logs, system user, DNS record and certificate.</p>
+  <p>Stops the app and removes its builds, logs, system user, DNS record and certificate.</p>
   <form method="post" action="/apps/{{.Name}}/delete" class="grid" data-confirm="Delete {{.Name}}? This cannot be undone.">
     {{template "csrf" $csrf}}
     <label><span>Type <b>{{.Name}}</b> to confirm</span> <input name="confirm" autocomplete="off" required></label>

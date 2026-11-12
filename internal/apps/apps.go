@@ -44,6 +44,7 @@ type Edge interface {
 type App struct {
 	Name      string
 	Repo      string // https://github.com/<owner>/<repo>
+	Branch    string // the branch deploys build from
 	Domain    string
 	Port      int
 	Limits    app.Limits
@@ -55,7 +56,8 @@ type App struct {
 // fields mean "default" on create; edits send every field. The name is
 // never entered: it is derived from the repository name.
 type Input struct {
-	Repo, Domain      string
+	Repo, Branch      string
+	Domain            string
 	Memory, CPU, Pids string
 	// RestoreFrom (create only) is a bucket folder whose newest backup is
 	// restored into the new app ("" = start empty, AutoFolder = the folder
@@ -125,12 +127,12 @@ func (s *Service) Load(ctx context.Context) error {
 	return nil
 }
 
-const appCols = `name, repo, domain, port, memory_max, cpu_max, pids_max, created_at`
+const appCols = `name, repo, branch, domain, port, memory_max, cpu_max, pids_max, created_at`
 
 func scanApp(r interface{ Scan(...any) error }) (App, error) {
 	var a App
 	var created int64
-	err := r.Scan(&a.Name, &a.Repo, &a.Domain, &a.Port, &a.Limits.MemoryMax, &a.Limits.CPUMax, &a.Limits.PidsMax, &created)
+	err := r.Scan(&a.Name, &a.Repo, &a.Branch, &a.Domain, &a.Port, &a.Limits.MemoryMax, &a.Limits.CPUMax, &a.Limits.PidsMax, &created)
 	a.CreatedAt = time.Unix(created, 0)
 	return a, err
 }
@@ -211,7 +213,8 @@ func (s *Service) config(ctx context.Context, a App) (deployer.AppConfig, error)
 			Name: a.Name, Domain: a.Domain, Port: a.Port,
 			HealthPath: app.DefaultHealthPath, Env: env, Limits: a.Limits,
 		},
-		Repo: repo,
+		Repo:   repo,
+		Branch: a.Branch,
 	}, nil
 }
 
@@ -236,6 +239,13 @@ func (s *Service) validate(ctx context.Context, in Input, existing *App) (App, e
 		case name != existing.Name:
 			errs = append(errs, fmt.Errorf("the app is named after its repository, so it can only move to a repository named %q", existing.Name))
 		}
+	}
+	if repo, err := github.ParseRepo(in.Repo); err == nil && len(errs) == 0 {
+		branch, err := s.checkBranch(ctx, repo, strings.TrimSpace(in.Branch), existing)
+		if err != nil {
+			errs = append(errs, err)
+		}
+		a.Branch = branch
 	}
 	a.Domain = strings.ToLower(strings.TrimSpace(in.Domain))
 	if a.Domain != "" {
@@ -289,6 +299,38 @@ func (s *Service) validate(ctx context.Context, in Input, existing *App) (App, e
 		}
 	}
 	return a, errors.Join(errs...)
+}
+
+// checkBranch returns the branch to build: the one given, after checking
+// GitHub has it, or the repository's default branch when none is given.
+// An unchanged branch of an existing app is not checked again.
+func (s *Service) checkBranch(ctx context.Context, repo github.Repo, branch string, existing *App) (string, error) {
+	if existing != nil && branch == existing.Branch && repo.URL() == existing.Repo && branch != "" {
+		return branch, nil
+	}
+	if branch != "" {
+		if err := github.ValidBranch(branch); err != nil {
+			return branch, err
+		}
+	}
+	token, err := s.dep.GitHubToken(ctx)
+	if err != nil {
+		return branch, err
+	}
+	api := &github.API{Token: token, Base: s.dep.GitHubBase}
+	gctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if branch == "" {
+		info, err := api.Repo(gctx, repo)
+		if err != nil {
+			return "", fmt.Errorf("branch: %w", err)
+		}
+		return info.DefaultBranch, nil
+	}
+	if err := api.BranchExists(gctx, repo, branch); err != nil {
+		return branch, fmt.Errorf("branch: %w", err)
+	}
+	return branch, nil
 }
 
 func (s *Service) freePort() (int, error) {
@@ -366,8 +408,8 @@ func (s *Service) create(ctx context.Context, in Input) (App, error) {
 	}
 	a.CreatedAt = time.Now()
 	if _, err := s.db.Writer().ExecContext(ctx, `INSERT INTO apps (`+appCols+`)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		a.Name, a.Repo, a.Domain, a.Port, a.Limits.MemoryMax, a.Limits.CPUMax, a.Limits.PidsMax, a.CreatedAt.Unix()); err != nil {
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		a.Name, a.Repo, a.Branch, a.Domain, a.Port, a.Limits.MemoryMax, a.Limits.CPUMax, a.Limits.PidsMax, a.CreatedAt.Unix()); err != nil {
 		return a, fmt.Errorf("save app: %w", err)
 	}
 	cfg, err := s.config(ctx, a)
@@ -396,13 +438,16 @@ func (s *Service) Update(ctx context.Context, name string, in Input) (App, error
 	if err != nil {
 		return a, err
 	}
-	if _, err := s.db.Writer().ExecContext(ctx, `UPDATE apps SET repo = ?, domain = ?, memory_max = ?,
+	if _, err := s.db.Writer().ExecContext(ctx, `UPDATE apps SET repo = ?, branch = ?, domain = ?, memory_max = ?,
 		cpu_max = ?, pids_max = ? WHERE name = ?`,
-		a.Repo, a.Domain, a.Limits.MemoryMax, a.Limits.CPUMax, a.Limits.PidsMax, name); err != nil {
+		a.Repo, a.Branch, a.Domain, a.Limits.MemoryMax, a.Limits.CPUMax, a.Limits.PidsMax, name); err != nil {
 		return a, err
 	}
 	if err := s.pushConfig(ctx, a); err != nil {
 		return a, err
+	}
+	if cur.Branch != a.Branch || cur.Repo != a.Repo {
+		s.dep.ForgetCommits(name)
 	}
 	if cur.Domain != a.Domain {
 		s.refreshEdge(a.Domain != "")
@@ -470,7 +515,7 @@ type DeleteResult struct {
 }
 
 // Delete stops and removes an app: process, cgroup, user,
-// releases, logs, caches, routing, DNS record and certificate. DATA_DIR is
+// builds, logs, routing, DNS record and certificate. DATA_DIR is
 // moved aside if keepData is set, otherwise deleted. Backups are kept
 // unless deleteBackups is set.
 func (s *Service) Delete(ctx context.Context, name string, keepData, deleteBackups bool) (DeleteResult, error) {

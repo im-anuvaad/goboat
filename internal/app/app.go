@@ -12,9 +12,9 @@ import (
 
 // ContractVersion is the app contract version goboat implements
 // (docs/app-contract.md).
-const ContractVersion = 3
+const ContractVersion = 1
 
-// Default resource limits (docs/app-contract.md §8).
+// Default resource limits (docs/app-contract.md §9).
 const (
 	DefaultMemoryMax  = 256 << 20
 	DefaultCPUMax     = 1.0
@@ -33,11 +33,13 @@ type Limits struct {
 // Spec is everything the supervisor needs to run one app.
 type Spec struct {
 	Name       string
-	Domain     string // informational until Phase 3
+	Domain     string
 	Port       int
-	ReleaseID  string
-	ReleaseDir string   // working directory; binary paths are relative to it
-	Run        []string // argv; Run[0] is relative to ReleaseDir unless absolute
+	BuildID    string   // the kept build the app runs ("" = never deployed)
+	Branch     string   // branch the build came from
+	Commit     string   // full commit SHA of the build
+	Dir        string   // working directory: the build's source tree
+	Run        []string // argv; Run[0] is the absolute path of the built binary
 	HealthPath string
 	Env        map[string]string // user env vars (reserved names rejected)
 	Limits     Limits
@@ -98,14 +100,13 @@ func (s *Spec) Validate() error {
 	if s.Port < 1024 || s.Port > 65535 {
 		errs = append(errs, fmt.Errorf("app %q: port %d out of range 1024-65535", s.Name, s.Port))
 	}
-	// An app without a release (never deployed) has no release dir or run
-	// command yet.
-	if s.ReleaseID != "" {
-		if !strings.HasPrefix(s.ReleaseDir, "/") {
-			errs = append(errs, fmt.Errorf("app %q: release dir must be an absolute path", s.Name))
+	// An app that was never deployed has no build dir or binary yet.
+	if s.BuildID != "" {
+		if !strings.HasPrefix(s.Dir, "/") {
+			errs = append(errs, fmt.Errorf("app %q: build dir must be an absolute path", s.Name))
 		}
-		if len(s.Run) == 0 || s.Run[0] == "" {
-			errs = append(errs, fmt.Errorf("app %q: run command is empty", s.Name))
+		if len(s.Run) == 0 || !strings.HasPrefix(s.Run[0], "/") {
+			errs = append(errs, fmt.Errorf("app %q: the binary path must be absolute", s.Name))
 		}
 	}
 	if s.HealthPath == "" {
@@ -153,53 +154,4 @@ func ParseBytes(s string) (int64, error) {
 		return 0, fmt.Errorf("invalid size %q (examples: 256M, 1G)", s)
 	}
 	return v * mult, nil
-}
-
-// SplitCommand splits a run command into argv. It supports single and
-// double quotes and backslash escapes, but no shell features (no pipes,
-// globbing, variables or &&), as specified by the app contract.
-func SplitCommand(s string) ([]string, error) {
-	var (
-		args    []string
-		cur     strings.Builder
-		inArg   bool
-		quote   rune
-		escaped bool
-	)
-	for _, r := range s {
-		switch {
-		case escaped:
-			cur.WriteRune(r)
-			escaped = false
-		case r == '\\' && quote != '\'':
-			escaped, inArg = true, true
-		case quote != 0:
-			if r == quote {
-				quote = 0
-			} else {
-				cur.WriteRune(r)
-			}
-		case r == '\'' || r == '"':
-			quote, inArg = r, true
-		case r == ' ' || r == '\t' || r == '\n':
-			if inArg {
-				args = append(args, cur.String())
-				cur.Reset()
-				inArg = false
-			}
-		default:
-			cur.WriteRune(r)
-			inArg = true
-		}
-	}
-	if escaped || quote != 0 {
-		return nil, fmt.Errorf("unterminated quote or escape in command %q", s)
-	}
-	if inArg {
-		args = append(args, cur.String())
-	}
-	if len(args) == 0 {
-		return nil, errors.New("command is empty")
-	}
-	return args, nil
 }

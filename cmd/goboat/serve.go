@@ -16,6 +16,7 @@ import (
 	"github.com/im-anuvaad/goboat/internal/apps"
 	"github.com/im-anuvaad/goboat/internal/auth"
 	"github.com/im-anuvaad/goboat/internal/backup"
+	"github.com/im-anuvaad/goboat/internal/builder"
 	"github.com/im-anuvaad/goboat/internal/buildinfo"
 	"github.com/im-anuvaad/goboat/internal/cgroup"
 	"github.com/im-anuvaad/goboat/internal/deployer"
@@ -79,8 +80,12 @@ func serve(log *slog.Logger) error {
 	}
 
 	sup := supervisor.New(supervisor.Deps{Layout: lay, Cgroups: cg, Log: log})
+	bld := &builder.Builder{Layout: lay, Cgroups: cg, Log: log.With("component", "builder")}
+	if err := bld.Init(); err != nil {
+		return err
+	}
 	dep, err := deployer.New(ctx, deployer.Deps{
-		Layout: lay, Store: st, Secrets: box, Supervisor: sup, Log: log,
+		Layout: lay, Store: st, Secrets: box, Supervisor: sup, Builder: bld, Log: log,
 	})
 	if err != nil {
 		return err
@@ -195,9 +200,9 @@ func newBackups(lay layout.Layout, st *store.Store, box *secrets.Box, sup *super
 				}
 				return names
 			},
-			Release: func(name string) string {
+			Commit: func(name string) string {
 				if a := sup.Get(name); a != nil {
-					return a.Status().Release
+					return a.Status().Commit
 				}
 				return ""
 			},
@@ -270,7 +275,7 @@ func newEdge(ctx context.Context, log *slog.Logger, lay layout.Layout, st *store
 func logStatus(log *slog.Logger, sup *supervisor.Supervisor) {
 	for _, a := range sup.Apps() {
 		s := a.Status()
-		attrs := []any{"app", a.Spec().Name, "state", s.State, "pid", s.PID, "release", s.Release,
+		attrs := []any{"app", a.Spec().Name, "state", s.State, "pid", s.PID, "commit", s.Commit,
 			"restarts", s.Restarts, "oom_kills", s.OOMKills}
 		if s.LastExit != "" {
 			attrs = append(attrs, "last_exit", s.LastExit)

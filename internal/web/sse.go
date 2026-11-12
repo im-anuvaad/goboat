@@ -76,7 +76,7 @@ func (s *Server) deploymentStream(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	path := s.Layout.BuildLog(d.App, d.ID)
+	path := s.Layout.DeployLog(d.App, d.ID)
 	sse := newSSE(w)
 	var off int64
 	var partial string

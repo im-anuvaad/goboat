@@ -21,7 +21,7 @@ Behaviour stays as it is (release-based deploys still work), so the rename can b
 - Replace the migrations with one fresh schema without unused columns. No data to migrate: there is no installed base.
 - Done when: `grep -ri` for the old name finds nothing (files, paths, binary strings), lint and tests pass, a pre-release installs on VPS 1 and serves the dashboard on `goboat.doot.run`.
 
-## Phase 2: build on the server
+## Phase 2: build on the server (done)
 
 - `install.sh`: Go toolchain into `/usr/local/lib/goboat/go` (checksum from go.dev), 2 GB swap file, `vm.swappiness`, RAM/disk checks, `goboatbuild` user.
 - `github`: branches, commits of a branch, source archive download.
@@ -32,12 +32,15 @@ Behaviour stays as it is (release-based deploys still work), so the rename can b
 - Dashboard: branch on Add app and Settings, commit list and **Deploy**, build log streamed on the deployment page, `GOBOAT_BRANCH`/`GOBOAT_COMMIT`.
 - Remove the release download path.
 - Done when, on VPS 1: `hello` builds and deploys from a branch, a second deploy after a one-line change uses warm caches, rollback works without a rebuild, `broken` fails without touching the running build, `heavy` builds using swap while `hello` keeps serving, a build over the limit fails with an out-of-memory message.
+- Result: all of the above checked on VPS 1 with `v0.0.2-rc1` (figures in architecture §7.3). Also checked: an update by re-running the installer migrates the database and installs Go and swap; restarting goboat during a build marks it failed and leaves no build processes, cgroups or workspaces; an app cannot read another app's builds, and the build user cannot read any app's.
+- Moved to phase 3: the build's CPU/memory/swap as a chart (the deploy log has its peaks), and the "swap in use outside builds" warning.
 
 ## Phase 3: app form and limits (quirks A, B, C)
 
 - Domain required on Add app ("Enter the domain the app will be served on"), cannot be cleared in Settings; DB column `NOT NULL` with a unique index.
 - Memory and CPU drop-downs on Add app and Settings (architecture §6.1); total memory against RAM shown, warning above 75 %.
 - Settings save shows "restart needed" with a **Restart** button.
+- Monitoring: a "swap in use outside builds" warning, and the last build's CPU, memory and swap on the deployment page.
 - Contract docs and form texts say limits come only from the dashboard.
 - Done when: creating an app without a domain is refused with that message; limits picked in the form are the values in the app's cgroup files after a restart.
 

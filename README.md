@@ -96,7 +96,7 @@ Run the install command again. It installs the latest goboat and Go toolchain, k
 | `no Cloudflare zone found for …` when saving a domain | The domain isn't on this Cloudflare account, is misspelled, or the token doesn't cover that zone |
 | `… lacks the … permission` | Add the missing permission to the token, then **Sync now** in Settings |
 | Build fails with `goboat.toml` errors | The file is missing at the repository root or has an unknown key; see [docs/app-contract.md](docs/app-contract.md) |
-| Build fails with `signal: killed` or very slow builds | The build ran out of memory. Stop an app you don't need during the build, or use a bigger server |
+| Build fails with "the build ran out of memory", or builds are very slow | The build needed more than its 1.4–1.5 GB plus swap (the deploy log shows its peak memory and swap). Stop an app you don't need while building, or use a bigger server |
 | Build fails on a private module dependency | Not supported: only the app's own repository is fetched with the GitHub token; other modules must be public or vendored (`go mod vendor`) |
 | Dashboard domain stays "being set up" | The page says what it waits for: Cloudflare rolling out the origin pull certificate (about 10 minutes the first time), a zone in Flexible mode (**Set Full (strict)**), or a token without Zone Settings permission |
 | Cloudflare error 521 | The SSL/TLS mode is Flexible or Off: **Settings → Zones → Set Full (strict)**. A Page Rule or Configuration Rule can also set Flexible for one hostname; remove it |

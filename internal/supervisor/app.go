@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"sync"
@@ -68,7 +67,8 @@ var DefaultPolicy = Policy{
 type Status struct {
 	State      State
 	PID        int
-	Release    string
+	Commit     string // of the running build ("" = never deployed)
+	Branch     string
 	StartedAt  time.Time // current process spawn time
 	HealthyAt  time.Time
 	Restarts   int // automatic restarts since the last manual start
@@ -82,8 +82,8 @@ type Status struct {
 // ErrStopped is returned to Start waiters when the app is stopped meanwhile.
 var ErrStopped = errors.New("app was stopped")
 
-// ErrNoRelease is returned by Start for an app that was never deployed.
-var ErrNoRelease = errors.New("app has no release yet; deploy it first")
+// ErrNotDeployed is returned by Start for an app that was never deployed.
+var ErrNotDeployed = errors.New("app has not been deployed yet; deploy it first")
 
 type op int
 
@@ -153,7 +153,7 @@ func newApp(spec app.Spec, dirs layout.Layout, u users.User, g *cgroup.Group, lg
 		healthCh: make(chan healthEvent, 1),
 		quit:     make(chan struct{}),
 		spec:     spec,
-		status:   Status{State: Stopped, Release: spec.ReleaseID},
+		status:   Status{State: Stopped, Commit: spec.Commit, Branch: spec.Branch},
 		desired:  Stopped,
 	}
 	if st, err := g.Stats(); err == nil {
@@ -280,8 +280,8 @@ func (a *App) loop() {
 }
 
 func (a *App) handleStart(reply chan error) {
-	if a.Spec().ReleaseID == "" {
-		reply <- ErrNoRelease
+	if a.Spec().BuildID == "" {
+		reply <- ErrNotDeployed
 		return
 	}
 	a.desired = Running
@@ -345,7 +345,7 @@ func (a *App) handleUpdate(c command) {
 	}
 	a.mu.Lock()
 	a.spec = c.spec
-	a.status.Release = c.spec.ReleaseID
+	a.status.Commit, a.status.Branch = c.spec.Commit, c.spec.Branch
 	a.mu.Unlock()
 	c.reply <- nil
 }
@@ -366,9 +366,9 @@ func (a *App) spawn() {
 	now := time.Now()
 	a.setStatus(func(s *Status) {
 		s.State, s.PID, s.StartedAt, s.HealthyAt, s.NextStart = Starting, cmd.Process.Pid, now, time.Time{}, time.Time{}
-		s.Release = spec.ReleaseID
+		s.Commit, s.Branch = spec.Commit, spec.Branch
 	})
-	a.log.Writef("started pid %d (release %s): %s", cmd.Process.Pid, spec.ReleaseID, strconv.Quote(joinArgs(spec.Run)))
+	a.log.Writef("started pid %d (commit %s): %s", cmd.Process.Pid, shortSHA(spec.Commit), strconv.Quote(joinArgs(spec.Run)))
 
 	gen := a.gen
 	go func() {
@@ -400,9 +400,6 @@ func (a *App) spawn() {
 
 func (a *App) startProcess(spec app.Spec) (*exec.Cmd, error) {
 	bin := spec.Run[0]
-	if !filepath.IsAbs(bin) {
-		bin = filepath.Join(spec.ReleaseDir, bin)
-	}
 	st, err := os.Stat(bin)
 	if err != nil {
 		return nil, fmt.Errorf("run binary: %w", err)
@@ -429,7 +426,7 @@ func (a *App) startProcess(spec app.Spec) (*exec.Cmd, error) {
 	}
 
 	cmd := exec.Command(bin, spec.Run[1:]...)
-	cmd.Dir = spec.ReleaseDir
+	cmd.Dir = spec.Dir
 	cmd.Env = a.environ(spec)
 	cmd.Stdout, cmd.Stderr = outW, errW
 	cmd.SysProcAttr = &syscall.SysProcAttr{
@@ -458,7 +455,7 @@ func (a *App) startProcess(spec app.Spec) (*exec.Cmd, error) {
 	return cmd, nil
 }
 
-// environ builds the contract environment (docs/app-contract.md §3). The
+// environ builds the contract environment (docs/app-contract.md §5). The
 // process does not inherit goboat's environment.
 func (a *App) environ(spec app.Spec) []string {
 	env := map[string]string{
@@ -475,7 +472,8 @@ func (a *App) environ(spec app.Spec) []string {
 		"TMPDIR":          a.tmpDir(spec),
 		"GOBOAT_APP":      spec.Name,
 		"GOBOAT_DOMAIN":   spec.Domain,
-		"GOBOAT_RELEASE":  spec.ReleaseID,
+		"GOBOAT_BRANCH":   spec.Branch,
+		"GOBOAT_COMMIT":   spec.Commit,
 		"GOBOAT_CONTRACT": strconv.Itoa(app.ContractVersion),
 	}
 	for k, v := range contract {
@@ -483,7 +481,7 @@ func (a *App) environ(spec app.Spec) []string {
 	}
 	// Go does not read the cgroup memory limit, so without this a Go app
 	// grows until the kernel OOM-kills it instead of collecting garbage.
-	// Other languages ignore it. A GOMEMLIMIT set by the user wins.
+	// A GOMEMLIMIT set by the user wins.
 	if _, set := env["GOMEMLIMIT"]; !set && spec.Limits.MemoryMax > 0 {
 		env["GOMEMLIMIT"] = strconv.FormatInt(GoMemLimit(spec.Limits.MemoryMax), 10)
 	}
@@ -665,4 +663,11 @@ func formatBytes(n int64) string {
 	default:
 		return fmt.Sprintf("%dB", n)
 	}
+}
+
+func shortSHA(s string) string {
+	if s == "" {
+		return "none"
+	}
+	return s[:min(7, len(s))]
 }

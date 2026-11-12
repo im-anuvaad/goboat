@@ -12,7 +12,7 @@ import (
 // Deployment statuses.
 const (
 	StatusQueued    = "queued"
-	StatusPreparing = "preparing" // downloading, verifying and unpacking the release
+	StatusBuilding  = "building" // downloading the source and building it
 	StatusDeploying = "deploying"
 	StatusSucceeded = "succeeded"
 	StatusFailed    = "failed"
@@ -30,8 +30,9 @@ type Deployment struct {
 	App        string    `json:"app"`
 	Kind       string    `json:"kind"`
 	Status     string    `json:"status"`
-	ReleaseID  string    `json:"release_id"`
+	BuildID    string    `json:"build_id"`
 	GitSHA     string    `json:"git_sha"`
+	Branch     string    `json:"branch"`
 	Error      string    `json:"error"`
 	CreatedAt  time.Time `json:"created_at"`
 	StartedAt  time.Time `json:"started_at"`
@@ -41,17 +42,28 @@ type Deployment struct {
 // Done reports whether the deployment has finished.
 func (d Deployment) Done() bool { return d.Status == StatusSucceeded || d.Status == StatusFailed }
 
-// Release is a GitHub release unpacked on the server (at most KeepReleases).
-type Release struct {
-	App        string    `json:"app"`
-	ID         string    `json:"id"`      // the tag
-	Subject    string    `json:"subject"` // the release name
-	SHA256     string    `json:"sha256"`  // of the tarball
-	Run        []string  `json:"run"`
-	HealthPath string    `json:"health_path"`
-	CreatedAt  time.Time `json:"created_at"`
-	Current    bool      `json:"current"`
+// Build is a build kept on the server (at most KeepBuilds per app).
+type Build struct {
+	App        string        `json:"app"`
+	ID         string        `json:"id"` // BuildID(GitSHA)
+	GitSHA     string        `json:"git_sha"`
+	Branch     string        `json:"branch"`
+	Subject    string        `json:"subject"`
+	GoVersion  string        `json:"go_version"`
+	Package    string        `json:"package"`
+	Args       []string      `json:"args"`
+	HealthPath string        `json:"health_path"`
+	Size       int64         `json:"size"`
+	BuildTime  time.Duration `json:"build_time"`
+	CreatedAt  time.Time     `json:"created_at"`
+	Current    bool          `json:"current"`
 }
+
+// Short is the first 7 characters of the commit SHA.
+func (b Build) Short() string { return b.GitSHA[:min(7, len(b.GitSHA))] }
+
+// BuildID is the id (and directory name) of the build of a commit.
+func BuildID(sha string) string { return sha[:min(12, len(sha))] }
 
 func unix(t time.Time) int64 {
 	if t.IsZero() {
@@ -67,20 +79,24 @@ func fromUnix(n int64) time.Time {
 	return time.Unix(n, 0).UTC()
 }
 
-const deploymentCols = `id, app, kind, status, release_id, git_sha, error, created_at, started_at, finished_at`
+const deploymentCols = `id, app, kind, status, build_id, git_sha, branch, error, created_at, started_at, finished_at`
 
 func scanDeployment(s interface{ Scan(...any) error }) (Deployment, error) {
 	var d Deployment
 	var c, st, f int64
-	err := s.Scan(&d.ID, &d.App, &d.Kind, &d.Status, &d.ReleaseID, &d.GitSHA, &d.Error, &c, &st, &f)
+	err := s.Scan(&d.ID, &d.App, &d.Kind, &d.Status, &d.BuildID, &d.GitSHA, &d.Branch, &d.Error, &c, &st, &f)
 	d.CreatedAt, d.StartedAt, d.FinishedAt = fromUnix(c), fromUnix(st), fromUnix(f)
 	return d, err
 }
 
-func (d *Deployer) insertDeployment(ctx context.Context, app, kind, releaseID string) (int64, error) {
+func (d *Deployer) insertDeployment(ctx context.Context, app, kind, sha, branch string) (int64, error) {
+	buildID := ""
+	if sha != "" {
+		buildID = BuildID(sha)
+	}
 	res, err := d.db.Writer().ExecContext(ctx,
-		`INSERT INTO deployments (app, kind, status, release_id, created_at) VALUES (?, ?, ?, ?, ?)`,
-		app, kind, StatusQueued, releaseID, time.Now().Unix())
+		`INSERT INTO deployments (app, kind, status, build_id, git_sha, branch, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		app, kind, StatusQueued, buildID, sha, branch, time.Now().Unix())
 	if err != nil {
 		return 0, fmt.Errorf("deployer: record deployment: %w", err)
 	}
@@ -89,16 +105,10 @@ func (d *Deployer) insertDeployment(ctx context.Context, app, kind, releaseID st
 
 func (d *Deployer) setStatus(id int64, status string) {
 	col := ""
-	if status == StatusPreparing {
+	if status == StatusBuilding {
 		col = ", started_at = " + fmt.Sprint(time.Now().Unix())
 	}
 	if _, err := d.db.Writer().Exec(`UPDATE deployments SET status = ?`+col+` WHERE id = ?`, status, id); err != nil {
-		d.log.Error("update deployment", "id", id, "err", err)
-	}
-}
-
-func (d *Deployer) setRelease(id int64, releaseID, sha string) {
-	if _, err := d.db.Writer().Exec(`UPDATE deployments SET release_id = ?, git_sha = ? WHERE id = ?`, releaseID, sha, id); err != nil {
 		d.log.Error("update deployment", "id", id, "err", err)
 	}
 }
@@ -142,65 +152,72 @@ func (d *Deployer) Deployments(ctx context.Context, app string, limit int) ([]De
 	return out, rows.Err()
 }
 
-func (d *Deployer) insertRelease(ctx context.Context, r Release) error {
-	run, _ := json.Marshal(r.Run)
-	_, err := d.db.Writer().ExecContext(ctx, `INSERT INTO releases
-		(app, id, subject, sha256, run, health_path, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		r.App, r.ID, r.Subject, r.SHA256, string(run), r.HealthPath, unix(r.CreatedAt))
+func (d *Deployer) insertBuild(ctx context.Context, b Build) error {
+	args, _ := json.Marshal(b.Args)
+	_, err := d.db.Writer().ExecContext(ctx, `INSERT INTO builds
+		(app, id, git_sha, branch, subject, go_version, package, args, health_path, size, build_ms, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (app, id) DO UPDATE SET git_sha = excluded.git_sha, branch = excluded.branch,
+		subject = excluded.subject, go_version = excluded.go_version, package = excluded.package,
+		args = excluded.args, health_path = excluded.health_path, size = excluded.size,
+		build_ms = excluded.build_ms, created_at = excluded.created_at`,
+		b.App, b.ID, b.GitSHA, b.Branch, b.Subject, b.GoVersion, b.Package, string(args), b.HealthPath,
+		b.Size, b.BuildTime.Milliseconds(), unix(b.CreatedAt))
 	return err
 }
 
-func (d *Deployer) deleteRelease(app, id string) error {
-	_, err := d.db.Writer().Exec(`DELETE FROM releases WHERE app = ? AND id = ?`, app, id)
+func (d *Deployer) deleteBuild(app, id string) error {
+	_, err := d.db.Writer().Exec(`DELETE FROM builds WHERE app = ? AND id = ?`, app, id)
 	return err
 }
 
-// release loads one release row.
-func (d *Deployer) release(ctx context.Context, app, id string) (Release, error) {
-	rs, err := d.queryReleases(ctx, `WHERE app = ? AND id = ?`, app, id)
+// build loads one kept build.
+func (d *Deployer) build(ctx context.Context, app, id string) (Build, error) {
+	bs, err := d.queryBuilds(ctx, `WHERE app = ? AND id = ?`, app, id)
 	if err != nil {
-		return Release{}, err
+		return Build{}, err
 	}
-	if len(rs) == 0 {
-		return Release{}, fmt.Errorf("release %s of %s not found (only the last 3 releases are kept)", id, app)
+	if len(bs) == 0 {
+		return Build{}, fmt.Errorf("build %s of %s is not kept on this server (only the last %d are)", id, app, KeepBuilds)
 	}
-	return rs[0], nil
+	return bs[0], nil
 }
 
-// Releases lists the kept releases of app, newest first.
-func (d *Deployer) Releases(ctx context.Context, app string) ([]Release, error) {
-	rs, err := d.queryReleases(ctx, `WHERE app = ? ORDER BY created_at DESC, id DESC`, app)
+// Builds lists the kept builds of app, newest first.
+func (d *Deployer) Builds(ctx context.Context, app string) ([]Build, error) {
+	bs, err := d.queryBuilds(ctx, `WHERE app = ? ORDER BY created_at DESC, id DESC`, app)
 	if err != nil {
 		return nil, err
 	}
-	cur := d.currentRelease(app)
-	for i := range rs {
-		rs[i].Current = rs[i].ID == cur
+	cur := d.currentBuild(app)
+	for i := range bs {
+		bs[i].Current = bs[i].ID == cur
 	}
-	return rs, nil
+	return bs, nil
 }
 
-func (d *Deployer) queryReleases(ctx context.Context, where string, args ...any) ([]Release, error) {
-	rows, err := d.db.Reader().QueryContext(ctx, `SELECT app, id, subject, sha256, run, health_path, created_at
-		FROM releases `+where, args...)
+func (d *Deployer) queryBuilds(ctx context.Context, where string, args ...any) ([]Build, error) {
+	rows, err := d.db.Reader().QueryContext(ctx, `SELECT app, id, git_sha, branch, subject, go_version, package,
+		args, health_path, size, build_ms, created_at FROM builds `+where, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Release
+	var out []Build
 	for rows.Next() {
-		var r Release
-		var run string
-		var created int64
-		if err := rows.Scan(&r.App, &r.ID, &r.Subject, &r.SHA256, &run, &r.HealthPath, &created); err != nil {
+		var b Build
+		var argv string
+		var ms, created int64
+		if err := rows.Scan(&b.App, &b.ID, &b.GitSHA, &b.Branch, &b.Subject, &b.GoVersion, &b.Package,
+			&argv, &b.HealthPath, &b.Size, &ms, &created); err != nil {
 			return nil, err
 		}
-		if err := json.Unmarshal([]byte(run), &r.Run); err != nil {
-			return nil, fmt.Errorf("release %s: bad run column: %w", r.ID, err)
+		if err := json.Unmarshal([]byte(argv), &b.Args); err != nil {
+			return nil, fmt.Errorf("build %s: bad args column: %w", b.ID, err)
 		}
-		r.CreatedAt = fromUnix(created)
-		out = append(out, r)
+		b.BuildTime = time.Duration(ms) * time.Millisecond
+		b.CreatedAt = fromUnix(created)
+		out = append(out, b)
 	}
 	return out, rows.Err()
 }
@@ -228,7 +245,7 @@ func (d *Deployer) SetDesired(ctx context.Context, app string, running bool) err
 func (d *Deployer) recoverInterrupted(ctx context.Context) (int64, error) {
 	res, err := d.db.Writer().ExecContext(ctx, `UPDATE deployments
 		SET status = ?, error = 'interrupted: goboat restarted during this deployment', finished_at = ?
-		WHERE status IN (?, ?, ?, 'building')`, StatusFailed, time.Now().Unix(), StatusQueued, StatusPreparing, StatusDeploying)
+		WHERE status IN (?, ?, ?, 'preparing')`, StatusFailed, time.Now().Unix(), StatusQueued, StatusBuilding, StatusDeploying)
 	if err != nil {
 		return 0, err
 	}

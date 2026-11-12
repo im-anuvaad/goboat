@@ -8,13 +8,14 @@
   <dl class="facts">
     <dt>App</dt><dd><a href="/apps/{{.App}}">{{.App}}</a></dd>
     <dt>Kind</dt><dd>{{.Kind}}</dd>
-    <dt>Release</dt><dd>{{if .ReleaseID}}<code>{{.ReleaseID}}</code>{{else}}<span class="muted">-</span>{{end}}{{if .GitSHA}} · commit <code>{{short .GitSHA}}</code>{{end}}</dd>
+    <dt>Commit</dt><dd>{{if .GitSHA}}<code>{{short .GitSHA}}</code>{{if .Branch}} of <code>{{.Branch}}</code>{{end}}{{else}}<span class="muted">-</span>{{end}}</dd>
     <dt>Started</dt><dd>{{datetime .StartedAt}}{{if .FinishedAt.IsZero}}{{else}} · took {{dur .StartedAt .FinishedAt}}{{end}}</dd>
     {{if .Error}}<dt>Error</dt><dd class="error-text pre">{{.Error}}</dd>{{end}}
   </dl>
   {{if .Done}}
   <pre class="log">{{$.Data.Log}}</pre>
   {{else}}
+  {{with $.Data.Queue}}<p class="info">Waiting: {{.}} build or deployment{{if gt . 1}}s{{end}} ahead of it (one runs at a time).</p>{{end}}
   <p class="muted" data-stream-status>connecting…</p>
   <pre class="log" data-stream="/deployments/{{.ID}}/stream" data-reload-on-done></pre>
   {{end}}
