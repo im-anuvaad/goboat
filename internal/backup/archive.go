@@ -25,7 +25,7 @@ type Manifest struct {
 	App           string         `json:"app"`
 	Kind          string         `json:"kind"`
 	CreatedAt     time.Time      `json:"created_at"`
-	Release       string         `json:"release"`
+	Commit        string         `json:"commit"`
 	GoboatVersion string         `json:"goboat_version"`
 	Files         []ManifestFile `json:"files"`
 }

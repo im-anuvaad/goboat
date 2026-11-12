@@ -87,6 +87,7 @@ func (s *Server) Handler() (http.Handler, error) {
 	authed("GET /{$}", s.home)
 	authed("GET /apps/new", s.newAppPage)
 	authed("POST /apps", s.createApp)
+	authed("GET /github/branches", s.branchesJSON)
 	authed("GET /apps/{app}", s.appPage)
 	authed("POST /apps/{app}/deploy", s.deployApp)
 	authed("POST /apps/{app}/rollback", s.rollbackApp)
@@ -306,8 +307,8 @@ func (s *Server) parseTemplates() error {
 		"date":     func(t time.Time) string { return fmtTime(t, time.DateOnly) },
 		"bytes":    humanBytes,
 		"short": func(s string) string {
-			if len(s) > 10 {
-				return s[:10]
+			if len(s) > 7 {
+				return s[:7]
 			}
 			return s
 		},

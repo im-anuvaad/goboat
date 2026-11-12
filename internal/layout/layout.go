@@ -16,6 +16,9 @@ const (
 	DataRoot  = "/var/lib/goboat"
 	ConfigDir = "/etc/goboat"
 	MasterKey = "/etc/goboat/master.key"
+	// GoRoot is the Go toolchain goboat installs and builds with
+	// (docs/architecture.md §4). A system Go elsewhere is never used.
+	GoRoot = "/usr/local/lib/goboat/go"
 )
 
 // Layout resolves paths under the data root (DataRoot).
@@ -54,13 +57,20 @@ func (l Layout) AppsDir() string { return filepath.Join(l.Root, "apps") }
 // AppDir is <root>/apps/<app>.
 func (l Layout) AppDir(app string) string { return filepath.Join(l.AppsDir(), app) }
 
-// ReleasesDir is <root>/apps/<app>/releases.
-func (l Layout) ReleasesDir(app string) string { return filepath.Join(l.AppDir(app), "releases") }
+// BuildsDir is <root>/apps/<app>/builds: the kept builds.
+func (l Layout) BuildsDir(app string) string { return filepath.Join(l.AppDir(app), "builds") }
 
-// ReleaseDir is <root>/apps/<app>/releases/<id>.
-func (l Layout) ReleaseDir(app, id string) string { return filepath.Join(l.ReleasesDir(app), id) }
+// BuildDir is <root>/apps/<app>/builds/<id>: src/ (the source tree at the
+// commit, the app's working directory) and app (the binary).
+func (l Layout) BuildDir(app, id string) string { return filepath.Join(l.BuildsDir(app), id) }
 
-// CurrentLink is <root>/apps/<app>/current (symlink to the live release).
+// BuildSrc is the source tree of a kept build.
+func (l Layout) BuildSrc(app, id string) string { return filepath.Join(l.BuildDir(app, id), "src") }
+
+// BuildBinary is the binary of a kept build.
+func (l Layout) BuildBinary(app, id string) string { return filepath.Join(l.BuildDir(app, id), "app") }
+
+// CurrentLink is <root>/apps/<app>/current (symlink to the live build).
 func (l Layout) CurrentLink(app string) string { return filepath.Join(l.AppDir(app), "current") }
 
 // DataDir is the app's DATA_DIR.
@@ -75,34 +85,44 @@ func (l Layout) LogsDir(app string) string { return filepath.Join(l.AppDir(app),
 // AppLog is the active runtime log file.
 func (l Layout) AppLog(app string) string { return filepath.Join(l.LogsDir(app), "app.log") }
 
-// BuildLogsDir holds the per-deployment logs.
-func (l Layout) BuildLogsDir(app string) string { return filepath.Join(l.LogsDir(app), "builds") }
+// DeployLogsDir holds the per-deployment logs (build output included).
+func (l Layout) DeployLogsDir(app string) string { return filepath.Join(l.LogsDir(app), "deploys") }
 
-// DownloadsDir is <root>/downloads/<app>: temporary release downloads.
-func (l Layout) DownloadsDir(app string) string { return filepath.Join(l.Root, "downloads", app) }
-
-// BuildLog is the log file of one deployment.
-func (l Layout) BuildLog(app string, deployID int64) string {
-	return filepath.Join(l.BuildLogsDir(app), fmt.Sprintf("%d.log", deployID))
+// DeployLog is the log file of one deployment.
+func (l Layout) DeployLog(app string, deployID int64) string {
+	return filepath.Join(l.DeployLogsDir(app), fmt.Sprintf("%d.log", deployID))
 }
+
+// WorkRoot is <root>/work: build workspaces, emptied at start.
+func (l Layout) WorkRoot() string { return filepath.Join(l.Root, "work") }
+
+// WorkDir is the workspace of one build: <root>/work/<app>/<deployment id>.
+func (l Layout) WorkDir(app string, deployID int64) string {
+	return filepath.Join(l.WorkRoot(), app, fmt.Sprintf("%d", deployID))
+}
+
+// CacheDir is <root>/cache: the Go module and build caches shared by all
+// builds (owned by the build user).
+func (l Layout) CacheDir() string { return filepath.Join(l.Root, "cache") }
 
 type dir struct {
 	path  string
 	mode  os.FileMode
 	owned bool // owned by the app user instead of root
+	group bool // root-owned, group = the app user's group
 }
 
 func (l Layout) appDirs(app string) []dir {
 	return []dir{
-		{l.AppsDir(), 0o711, false},
-		{l.AppDir(app), 0o711, false},
-		{l.ReleasesDir(app), 0o755, false},
-		{l.DataDir(app), 0o700, true},
-		{l.TmpDir(app), 0o700, true},
-		{l.LogsDir(app), 0o700, false},
-		{l.BuildLogsDir(app), 0o700, false},
-		{filepath.Join(l.Root, "downloads"), 0o700, false},
-		{l.DownloadsDir(app), 0o700, false},
+		{l.AppsDir(), 0o711, false, false},
+		{l.AppDir(app), 0o711, false, false},
+		// Only the app (and root) may enter its builds: they hold its
+		// source code.
+		{l.BuildsDir(app), 0o750, false, true},
+		{l.DataDir(app), 0o700, true, false},
+		{l.TmpDir(app), 0o700, true, false},
+		{l.LogsDir(app), 0o700, false, false},
+		{l.DeployLogsDir(app), 0o700, false, false},
 	}
 }
 
@@ -116,6 +136,9 @@ func (l Layout) EnsureApp(app string, u users.User) error {
 		uid, gid := l.UID, l.GID
 		if d.owned {
 			uid, gid = int(u.UID), int(u.GID)
+		}
+		if d.group {
+			gid = int(u.GID)
 		}
 		if err := os.Lchown(d.path, uid, gid); err != nil {
 			return fmt.Errorf("layout: chown %s: %w", d.path, err)

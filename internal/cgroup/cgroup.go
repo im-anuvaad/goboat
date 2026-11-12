@@ -7,6 +7,7 @@
 //	<root>/                 goboat.service (delegated)
 //	  supervisor/           goboat itself
 //	  apps/<app>/           app runtime processes
+//	  builds/<build>/       one group per running build
 package cgroup
 
 import (
@@ -34,7 +35,8 @@ type Kind string
 
 // Group kinds.
 const (
-	Apps Kind = "apps"
+	Apps   Kind = "apps"
+	Builds Kind = "builds"
 )
 
 // wantedControllers are enabled wherever the kernel offers them.
@@ -76,11 +78,11 @@ func Setup(rootOverride string) (*Manager, error) {
 		return nil, fmt.Errorf("cgroup: move goboat into %s: %w", sup, err)
 	}
 
-	// 2. Enable controllers at the root, then in apps/.
+	// 2. Enable controllers at the root, then in apps/ and builds/.
 	if err := m.enableControllers(m.root); err != nil {
 		return nil, err
 	}
-	for _, k := range []Kind{Apps} {
+	for _, k := range []Kind{Apps, Builds} {
 		dir := filepath.Join(m.root, string(k))
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, fmt.Errorf("cgroup: create %s: %w", dir, err)
@@ -167,11 +169,12 @@ func (m *Manager) Group(kind Kind, name string) (*Group, error) {
 	return &Group{Path: dir, controllers: m.controllers}, nil
 }
 
-// ReapStale kills processes left in any app group, e.g. after a
-// goboat crash in a dev setup. It returns the names of groups it cleaned.
+// ReapStale kills processes left in any app or build group, e.g. after a
+// goboat crash. Build groups are removed too (they are per build). It
+// returns the names of groups it cleaned.
 func (m *Manager) ReapStale(ctx context.Context) ([]string, error) {
 	var cleaned []string
-	for _, k := range []Kind{Apps} {
+	for _, k := range []Kind{Apps, Builds} {
 		entries, err := os.ReadDir(filepath.Join(m.root, string(k)))
 		if err != nil {
 			return cleaned, fmt.Errorf("cgroup: %w", err)
@@ -182,6 +185,9 @@ func (m *Manager) ReapStale(ctx context.Context) ([]string, error) {
 			}
 			g := &Group{Path: filepath.Join(m.root, string(k), e.Name()), controllers: m.controllers}
 			if pop, _ := g.Populated(); !pop {
+				if k == Builds {
+					g.Remove()
+				}
 				continue
 			}
 			if err := g.Kill(); err != nil {
@@ -189,6 +195,9 @@ func (m *Manager) ReapStale(ctx context.Context) ([]string, error) {
 			}
 			if err := g.WaitEmpty(ctx); err != nil {
 				return cleaned, err
+			}
+			if k == Builds {
+				g.Remove()
 			}
 			cleaned = append(cleaned, string(k)+"/"+e.Name())
 		}
@@ -203,6 +212,7 @@ type Limits struct {
 	NoSwap     bool    // memory.swap.max = 0
 	CPUMax     float64 // cores (cpu.max)
 	CPUWeight  int     // 1-10000, default 100 (cpu.weight)
+	IOWeight   int     // 1-10000, default 100 (io.weight; only some I/O schedulers honour it)
 	PidsMax    int     // pids.max
 }
 
@@ -251,6 +261,9 @@ func (g *Group) SetLimits(l Limits) (skipped []string, err error) {
 	}
 	if l.CPUWeight > 0 {
 		errs = append(errs, set("cpu", "cpu.weight", strconv.Itoa(l.CPUWeight)))
+	}
+	if l.IOWeight > 0 {
+		errs = append(errs, set("io", "io.weight", "default "+strconv.Itoa(l.IOWeight)))
 	}
 	if l.PidsMax > 0 {
 		errs = append(errs, set("pids", "pids.max", strconv.Itoa(l.PidsMax)))
@@ -400,6 +413,14 @@ func readIOStat(path string) (r, w int64) {
 		}
 	}
 	return r, w
+}
+
+// Peaks returns the highest memory and swap use since the group was
+// created (memory.peak, memory.swap.peak; 0 where the kernel lacks them).
+func (g *Group) Peaks() (memory, swap int64) {
+	memory, _ = readInt(filepath.Join(g.Path, "memory.peak"))
+	swap, _ = readInt(filepath.Join(g.Path, "memory.swap.peak"))
+	return memory, swap
 }
 
 // Remove deletes the (empty) group.

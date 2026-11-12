@@ -1,70 +1,41 @@
-// Package artifact checks and unpacks release tarballs (docs/architecture.md
-// §7): the SHA-256 from checksums.txt, safe extraction, and an ELF check
-// that the app binary runs on this machine.
-package artifact
+// Package source unpacks the source archives goboat builds from (GitHub's
+// tarball of a commit, docs/architecture.md §7.2) and the Go toolchain
+// archive, safely, and checks that a built binary runs on this machine.
+package source
 
 import (
 	"archive/tar"
-	"bufio"
-	"bytes"
 	"compress/gzip"
-	"crypto/sha256"
 	"debug/elf"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 )
 
-// MaxUnpacked bounds the unpacked size of a release.
-const MaxUnpacked = 1 << 30
-
-// MaxEntries bounds the number of entries in a release tarball.
-const MaxEntries = 20000
-
-// AssetName is the tarball asset for a Go architecture (amd64, arm64).
-func AssetName(goarch string) string { return "app-linux-" + goarch + ".tar.gz" }
-
-// ChecksumsName is the checksums asset.
-const ChecksumsName = "checksums.txt"
-
-var sumLine = regexp.MustCompile(`^([0-9a-fA-F]{64}) [ *](.+)$`)
-
-// Checksum returns the SHA-256 listed for name in a sha256sum-style file.
-func Checksum(sums []byte, name string) (string, error) {
-	sc := bufio.NewScanner(bytes.NewReader(sums))
-	for sc.Scan() {
-		m := sumLine.FindStringSubmatch(strings.TrimSpace(sc.Text()))
-		if m != nil && (m[2] == name || m[2] == "./"+name) {
-			return strings.ToLower(m[1]), nil
-		}
-	}
-	return "", fmt.Errorf("%s has no line for %s", ChecksumsName, name)
+// Limits bound an archive.
+type Limits struct {
+	MaxBytes   int64 // total size of the regular files
+	MaxEntries int
+	// StripTop removes the single top-level directory every entry is in
+	// (GitHub's "<owner>-<repo>-<sha>/", Go's "go/"). Entries outside it
+	// are rejected.
+	StripTop bool
 }
 
-// FileSHA256 hashes a file.
-func FileSHA256(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
-}
+// SourceLimits apply to an app's source archive (docs/app-contract.md §3).
+var SourceLimits = Limits{MaxBytes: 500 << 20, MaxEntries: 50000, StripTop: true}
+
+// MaxArchive is the largest source archive goboat downloads.
+const MaxArchive = 100 << 20
 
 // Unpack extracts the gzipped tarball archive into dst (created). It
 // rejects absolute paths, "..", device files, hard links, symlinks that
-// point outside dst, paths through symlinks, and archives that expand to
-// more than max bytes. Files get mode 0644, or 0755 if any exec bit is set.
-func Unpack(archive, dst string, max int64) error {
+// point outside dst, paths through symlinks, and archives above lim. Files
+// get mode 0644, or 0755 if any exec bit is set; directories 0755.
+func Unpack(archive, dst string, lim Limits) error {
 	f, err := os.Open(archive)
 	if err != nil {
 		return err
@@ -80,9 +51,10 @@ func Unpack(archive, dst string, max int64) error {
 	}
 	tr := tar.NewReader(zr)
 	var total int64
+	top := ""
 	for n := 0; ; n++ {
-		if n > MaxEntries {
-			return fmt.Errorf("archive has more than %d entries", MaxEntries)
+		if n > lim.MaxEntries {
+			return fmt.Errorf("archive has more than %d entries", lim.MaxEntries)
 		}
 		h, err := tr.Next()
 		if err == io.EOF {
@@ -91,7 +63,20 @@ func Unpack(archive, dst string, max int64) error {
 		if err != nil {
 			return fmt.Errorf("reading the archive: %w", err)
 		}
+		if h.Typeflag == tar.TypeXGlobalHeader || h.Typeflag == tar.TypeXHeader {
+			continue // metadata only (GitHub stores the commit id here)
+		}
 		name := strings.TrimPrefix(h.Name, "./")
+		if lim.StripTop {
+			first, rest, _ := strings.Cut(strings.TrimSuffix(name, "/"), "/")
+			if top == "" {
+				top = first
+			}
+			if first != top || first == "" || first == ".." {
+				return fmt.Errorf("unexpected path %q in archive: everything must be inside %s/", h.Name, top)
+			}
+			name = rest
+		}
 		if name == "" || name == "." || name == "./" {
 			continue
 		}
@@ -116,8 +101,8 @@ func Unpack(archive, dst string, max int64) error {
 			}
 		case tar.TypeReg:
 			total += h.Size
-			if h.Size < 0 || total > max {
-				return fmt.Errorf("archive expands to more than %d MB", max>>20)
+			if h.Size < 0 || total > lim.MaxBytes {
+				return fmt.Errorf("archive expands to more than %d MB", lim.MaxBytes>>20)
 			}
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
@@ -149,8 +134,6 @@ func Unpack(archive, dst string, max int64) error {
 			if err := os.Symlink(lt, target); err != nil {
 				return err
 			}
-		case tar.TypeXGlobalHeader, tar.TypeXHeader:
-			// metadata only
 		default:
 			return fmt.Errorf("unsupported entry type %q for %q", h.Typeflag, h.Name)
 		}
@@ -182,28 +165,21 @@ func realParents(dst, rel string) error {
 
 var machines = map[string]elf.Machine{"amd64": elf.EM_X86_64, "arm64": elf.EM_AARCH64}
 
-// CheckBinary checks that rel (relative to root, staying inside it after
-// resolving symlinks) is an executable Linux ELF binary for goarch.
-func CheckBinary(root, rel, goarch string) error {
-	p := filepath.Join(root, rel)
-	real, err := filepath.EvalSymlinks(p)
+// CheckBinary checks that path is an executable Linux ELF binary for goarch.
+func CheckBinary(path, goarch string) error {
+	st, err := os.Lstat(path)
 	if err != nil {
-		return fmt.Errorf("run: %s is not in the release tarball (add it to FILES in the release workflow)", rel)
+		return fmt.Errorf("the build produced no binary: %w", err)
 	}
-	rootReal, _ := filepath.EvalSymlinks(root)
-	if real != rootReal && !strings.HasPrefix(real, rootReal+"/") {
-		return fmt.Errorf("run: %s points outside the release", rel)
-	}
-	st, err := os.Stat(real)
-	if err != nil || !st.Mode().IsRegular() {
-		return fmt.Errorf("run: %s is not a regular file", rel)
+	if !st.Mode().IsRegular() {
+		return fmt.Errorf("the build output %s is not a regular file", filepath.Base(path))
 	}
 	if st.Mode()&0o111 == 0 {
-		return fmt.Errorf("run: %s is not executable", rel)
+		return fmt.Errorf("the build output %s is not executable", filepath.Base(path))
 	}
-	f, err := elf.Open(real)
+	f, err := elf.Open(path)
 	if err != nil {
-		return fmt.Errorf("run: %s is not a Linux (ELF) binary", rel)
+		return fmt.Errorf("the build output %s is not a Linux (ELF) binary", filepath.Base(path))
 	}
 	defer f.Close()
 	want, ok := machines[goarch]
@@ -211,16 +187,10 @@ func CheckBinary(root, rel, goarch string) error {
 		return fmt.Errorf("unsupported server architecture %s", goarch)
 	}
 	if f.Machine != want {
-		built := f.Machine.String()
-		for arch, m := range machines {
-			if m == f.Machine {
-				built = arch
-			}
-		}
-		return fmt.Errorf("run: %s is built for %s, but this server is %s; the release has the wrong binary in %s", rel, built, goarch, AssetName(goarch))
+		return fmt.Errorf("the build output is for %s, but this server is %s", f.Machine, goarch)
 	}
 	if f.Type != elf.ET_EXEC && f.Type != elf.ET_DYN {
-		return fmt.Errorf("run: %s is not an executable (ELF type %s)", rel, f.Type)
+		return fmt.Errorf("the build output is not an executable (ELF type %s)", f.Type)
 	}
 	return nil
 }

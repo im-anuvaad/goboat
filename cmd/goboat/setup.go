@@ -19,6 +19,7 @@ import (
 	"github.com/im-anuvaad/goboat/internal/layout"
 	"github.com/im-anuvaad/goboat/internal/secrets"
 	"github.com/im-anuvaad/goboat/internal/store"
+	"github.com/im-anuvaad/goboat/internal/users"
 )
 
 // runSetupHost is the second half of install.sh (docs/architecture.md):
@@ -51,6 +52,17 @@ func setupHost(out io.Writer) error {
 		return err
 	}
 	if _, err := secrets.LoadOrCreate(layout.MasterKey); err != nil {
+		return err
+	}
+	// Builds (docs/architecture.md §4, §7.3): their user, the Go
+	// toolchain and swap.
+	if _, err := users.EnsureBuild(); err != nil {
+		return err
+	}
+	if err := installGo(context.Background(), out); err != nil {
+		return err
+	}
+	if err := ensureSwap(out); err != nil {
 		return err
 	}
 	if cur, err := os.ReadFile(systemd.UnitPath); err != nil || string(cur) != systemd.Unit {

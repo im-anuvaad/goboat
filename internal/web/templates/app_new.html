@@ -5,8 +5,10 @@
   {{with .Data.In}}
   <form method="post" action="/apps" class="grid">
     {{template "csrf" $.CSRF}}
-    <label class="wide">GitHub repository <input name="repo" value="{{.Repo}}" required placeholder="https://github.com/you/blog" list="repos">
-      <small>The app is named after the repository (e.g. <code>my_blog</code> becomes <code>my-blog</code>). It is deployed from the repository's GitHub releases, which its release workflow publishes (<a href="https://github.com/im-anuvaad/goboat/blob/main/docs/app-contract.md" target="_blank" rel="noopener">app contract</a>).</small></label>
+    <label class="wide">GitHub repository <input name="repo" value="{{.Repo}}" required placeholder="https://github.com/you/blog" list="repos" data-branches="new-branches">
+      <small>The app is named after the repository (e.g. <code>my_blog</code> becomes <code>my-blog</code>). goboat builds it on this server; the repository needs a <code>goboat.toml</code> (<a href="https://github.com/im-anuvaad/goboat/blob/main/docs/app-contract.md" target="_blank" rel="noopener">app contract</a>).</small></label>
+    <label class="wide">Branch <input name="branch" value="{{.Branch}}" placeholder="the repository's default branch" list="new-branches" autocomplete="off"><datalist id="new-branches"></datalist>
+      <small>Deploys build the commits of this branch. Leave it empty for the default branch.</small></label>
     {{with $.Data.Repos}}<datalist id="repos">{{range .}}<option value="https://github.com/{{.FullName}}">{{end}}</datalist>{{end}}
     <label class="wide">Domain <input name="domain" value="{{.Domain}}" placeholder="blog.example.com"><small>DNS record and certificate are created in Cloudflare</small></label>
     {{if $.Data.BucketSet}}

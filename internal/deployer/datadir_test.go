@@ -5,6 +5,8 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,9 +17,9 @@ import (
 )
 
 // Everything in DATA_DIR survives redeploys, not only the SQLite files that
-// get backed up (docs/app-contract.md §5). This runs the on-disk steps of
+// get backed up (docs/app-contract.md §7). This runs the on-disk steps of
 // several deploys (directory repair, switching `current`, wiping TMPDIR,
-// pruning old releases) and checks that DATA_DIR is untouched.
+// pruning old builds) and checks that DATA_DIR is untouched.
 func TestDataDirSurvivesRedeploys(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -60,15 +62,19 @@ func TestDataDirSurvivesRedeploys(t *testing.T) {
 		}
 	}
 
-	for i, tag := range []string{"v1", "v2", "v3", "v4", "v5"} {
+	var last string
+	for i := 1; i <= 5; i++ {
 		if err := l.EnsureApp(name, u); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.MkdirAll(l.ReleaseDir(name, tag), 0o755); err != nil {
+		sha := strings.Repeat(strconv.Itoa(i), 40)
+		tag := BuildID(sha)
+		last = tag
+		if err := os.MkdirAll(l.BuildSrc(name, tag), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		r := Release{App: name, ID: tag, Run: []string{"app"}, HealthPath: "/", CreatedAt: time.Unix(int64(1000+i), 0)}
-		if err := d.insertRelease(ctx, r); err != nil {
+		b := Build{App: name, ID: tag, GitSHA: sha, Branch: "main", Package: ".", HealthPath: "/", CreatedAt: time.Unix(int64(1000+i), 0)}
+		if err := d.insertBuild(ctx, b); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.WriteFile(filepath.Join(l.TmpDir(name), "scratch"), []byte("tmp"), 0o600); err != nil {
@@ -80,7 +86,7 @@ func TestDataDirSurvivesRedeploys(t *testing.T) {
 		if err := l.WipeTmp(name, u); err != nil {
 			t.Fatal(err)
 		}
-		d.pruneReleases(name, lg)
+		d.pruneBuilds(name, lg)
 	}
 
 	for p, want := range data {
@@ -92,10 +98,10 @@ func TestDataDirSurvivesRedeploys(t *testing.T) {
 	if left, _ := os.ReadDir(l.TmpDir(name)); len(left) != 0 {
 		t.Errorf("TMPDIR not wiped: %v", left)
 	}
-	if kept, _ := os.ReadDir(l.ReleasesDir(name)); len(kept) != KeepReleases {
-		t.Errorf("kept %d releases, want %d", len(kept), KeepReleases)
+	if kept, _ := os.ReadDir(l.BuildsDir(name)); len(kept) != KeepBuilds {
+		t.Errorf("kept %d builds, want %d", len(kept), KeepBuilds)
 	}
-	if cur := d.currentRelease(name); cur != "v5" {
-		t.Errorf("current = %q, want v5", cur)
+	if cur := d.currentBuild(name); cur != last {
+		t.Errorf("current = %q, want %s", cur, last)
 	}
 }

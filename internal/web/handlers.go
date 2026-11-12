@@ -235,7 +235,7 @@ func (s *Server) home(w http.ResponseWriter, r *http.Request) {
 func formInput(r *http.Request) apps.Input {
 	f := func(k string) string { return r.PostFormValue(k) }
 	return apps.Input{
-		Repo: f("repo"), Domain: f("domain"),
+		Repo: f("repo"), Branch: f("branch"), Domain: f("domain"),
 		Memory: f("memory"), CPU: f("cpu"), Pids: f("pids"),
 		RestoreFrom: f("restore_from"),
 	}
@@ -274,6 +274,37 @@ func (s *Server) newAppData(ctx context.Context, in apps.Input, err error) map[s
 	return d
 }
 
+// branchesJSON lists a repository's branches for the branch field of the
+// Add app and Settings forms (app.js), with its default branch first.
+func (s *Server) branchesJSON(w http.ResponseWriter, r *http.Request) {
+	repo, err := github.ParseRepo(r.URL.Query().Get("repo"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	tok, _ := s.githubToken(r.Context())
+	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
+	api := &github.API{Token: tok, Base: s.Dep.GitHubBase}
+	info, err := api.Repo(ctx, repo)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	bs, err := api.Branches(ctx, repo)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	out := []string{info.DefaultBranch}
+	for _, b := range bs {
+		if b != info.DefaultBranch {
+			out = append(out, b)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"default": info.DefaultBranch, "branches": out})
+}
+
 func (s *Server) githubToken(ctx context.Context) (string, bool) {
 	tok, err := s.Dep.GitHubToken(ctx)
 	return tok, err == nil && tok != ""
@@ -293,7 +324,7 @@ func (s *Server) createApp(w http.ResponseWriter, r *http.Request) {
 	case a.RestoredFrom != "":
 		msg += fmt.Sprintf(" Its data was restored from the newest backup in %s/ (%s).", a.RestoredFrom, strings.Join(a.Restored, ", "))
 	}
-	msg += " Add env vars if it needs any, then press Deploy."
+	msg += " Add env vars if it needs any, then press Deploy: goboat builds the newest commit of " + a.Branch + "."
 	if a.Domain != "" {
 		msg += " DNS and the certificate for " + a.Domain + " are being set up in the background."
 	}
@@ -332,9 +363,9 @@ func (s *Server) appPage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		row.App = full
-		data["Releases"], _ = s.Dep.Releases(r.Context(), name)
-		gh, err := s.Dep.GitHubReleases(r.Context(), name)
-		data["GitHubReleases"] = gh
+		data["Builds"], _ = s.Dep.Builds(r.Context(), name)
+		branch, commits, err := s.Dep.Commits(r.Context(), name)
+		data["Branch"], data["Commits"] = branch, commits
 		if err != nil {
 			data["GitHubErr"] = err.Error()
 		}
@@ -346,7 +377,7 @@ func (s *Server) appPage(w http.ResponseWriter, r *http.Request) {
 			data["Policy"] = s.policyText()
 		}
 		data["Edit"] = apps.Input{
-			Repo: full.Repo, Domain: full.Domain,
+			Repo: full.Repo, Branch: full.Branch, Domain: full.Domain,
 			Memory: humanLimit(full.Limits.MemoryMax), CPU: strconv.FormatFloat(full.Limits.CPUMax, 'f', -1, 64),
 			Pids: strconv.Itoa(full.Limits.PidsMax),
 		}
@@ -373,7 +404,7 @@ func humanLimit(n int64) string {
 
 func (s *Server) deployApp(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("app")
-	id, err := s.Dep.Deploy(r.Context(), name, r.PostFormValue("tag"))
+	id, err := s.Dep.Deploy(r.Context(), name, r.PostFormValue("sha"))
 	if err != nil {
 		redirect(w, r, "/apps/"+name, err, "")
 		return
@@ -383,7 +414,7 @@ func (s *Server) deployApp(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) rollbackApp(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("app")
-	id, err := s.Dep.Rollback(r.Context(), name, r.PostFormValue("release"))
+	id, err := s.Dep.Rollback(r.Context(), name, r.PostFormValue("build"))
 	if err != nil {
 		redirect(w, r, "/apps/"+name, err, "")
 		return
@@ -411,7 +442,7 @@ func (s *Server) appAction(w http.ResponseWriter, r *http.Request) {
 func (s *Server) updateApp(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("app")
 	_, err := s.Apps.Update(r.Context(), name, formInput(r))
-	msg := "Settings saved. Limits need a restart; the domain is re-routed now."
+	msg := "Settings saved. A new branch applies on the next deploy, new limits on the next restart; the domain is re-routed now."
 	redirect(w, r, "/apps/"+name, err, msg)
 }
 
@@ -479,7 +510,9 @@ func (s *Server) deploymentPage(w http.ResponseWriter, r *http.Request) {
 	}
 	data := map[string]any{"D": d}
 	if d.Done() {
-		data["Log"] = readLog(s.Layout.BuildLog(d.App, d.ID))
+		data["Log"] = readLog(s.Layout.DeployLog(d.App, d.ID))
+	} else {
+		data["Queue"] = s.Dep.QueuePosition(d.ID)
 	}
 	s.render(w, r, http.StatusOK, "deployment", fmt.Sprintf("Deployment #%d", d.ID), "apps", data)
 }
@@ -511,7 +544,7 @@ func (s *Server) setGitHubToken(w http.ResponseWriter, r *http.Request) {
 	tok := strings.TrimSpace(r.PostFormValue("token"))
 	if r.PostFormValue("remove") == "1" {
 		err := s.Dep.SetGitHubToken(ctx, "")
-		s.Dep.ForgetReleases("")
+		s.Dep.ForgetCommits("")
 		s.Store.Writer().ExecContext(ctx, `DELETE FROM settings WHERE key = ?`, settingGitHubLogin)
 		redirect(w, r, "/settings", err, "GitHub token removed.")
 		return
@@ -532,7 +565,7 @@ func (s *Server) setGitHubToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.Store.SetSetting(ctx, settingGitHubLogin, []byte(info.Login))
-	s.Dep.ForgetReleases("")
+	s.Dep.ForgetCommits("")
 	redirect(w, r, "/settings", nil, "GitHub token saved (encrypted). It belongs to "+info.Login+".")
 }
 

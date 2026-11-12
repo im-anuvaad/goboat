@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -15,39 +16,58 @@ import (
 	"github.com/im-anuvaad/goboat/internal/app"
 )
 
-// FileName is the manifest file name at the app root.
+// FileName is the manifest file name at the repository root.
 const FileName = "goboat.toml"
 
 const maxSize = 64 << 10
 
-// Manifest is a validated goboat.toml (contract 3: it only says how to run
-// the app; the app is built by its release workflow).
+// Manifest is a validated goboat.toml: what to build and how to check the
+// app is up. Everything operational (domain, branch, limits, env vars) is
+// set in the dashboard.
 type Manifest struct {
 	Contract   int
-	Run        []string // argv; Run[0] relative to the release root
+	Package    string   // the main package, e.g. "." or "./cmd/web"
+	Args       []string // command-line arguments for the binary
 	HealthPath string
 }
 
 type raw struct {
-	Contract   *int    `toml:"contract"`
-	Run        *string `toml:"run"`
-	HealthPath *string `toml:"health_path"`
+	Contract   *int      `toml:"contract"`
+	Package    *string   `toml:"package"`
+	Args       *[]string `toml:"args"`
+	HealthPath *string   `toml:"health_path"`
+}
+
+// dashboardKeys are settings people expect in a config file that goboat
+// takes only from the dashboard; they get a pointed message instead of
+// "unknown key".
+var dashboardKeys = map[string]string{
+	"memory": "limits", "memory_max": "limits", "memory_limit": "limits",
+	"cpu": "limits", "cpus": "limits", "cpu_max": "limits", "cpu_limit": "limits",
+	"pids": "limits", "pids_max": "limits", "processes": "limits",
+	"limits": "limits", "resources": "limits",
+	"domain": "domain", "domains": "domain", "branch": "branch",
+	"env": "env vars", "environment": "env vars",
 }
 
 // Load reads dir/goboat.toml and validates it.
 func Load(dir string) (*Manifest, error) {
 	p := filepath.Join(dir, FileName)
-	f, err := os.Open(p)
+	st, err := os.Lstat(p)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("%s not found at the root of the release tarball; see docs/app-contract.md", FileName)
+		return nil, fmt.Errorf("%s not found at the root of the repository at this commit; add one (docs/app-contract.md §2)", FileName)
 	}
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
-	if st, err := f.Stat(); err != nil || !st.Mode().IsRegular() {
+	if !st.Mode().IsRegular() {
 		return nil, fmt.Errorf("%s must be a regular file", FileName)
 	}
+	f, err := os.Open(p)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
 	b, err := io.ReadAll(io.LimitReader(f, maxSize+1))
 	if err != nil {
 		return nil, err
@@ -67,9 +87,17 @@ func Parse(b []byte) (*Manifest, error) {
 	}
 	var errs []error
 	for _, k := range md.Undecoded() {
-		errs = append(errs, fmt.Errorf("unknown key %q", k.String()))
+		key := k.String()
+		top, _, _ := strings.Cut(key, ".")
+		if what, ok := dashboardKeys[strings.ToLower(top)]; ok {
+			if top == key || len(k) == 1 {
+				errs = append(errs, fmt.Errorf("%q: %s are set in the dashboard (the app's Settings), not in %s; remove it", key, what, FileName))
+			}
+			continue
+		}
+		errs = append(errs, fmt.Errorf("unknown key %q", key))
 	}
-	m := &Manifest{HealthPath: app.DefaultHealthPath}
+	m := &Manifest{Package: ".", HealthPath: app.DefaultHealthPath}
 
 	switch {
 	case r.Contract == nil:
@@ -80,14 +108,22 @@ func Parse(b []byte) (*Manifest, error) {
 		m.Contract = *r.Contract
 	}
 
-	if r.Run == nil {
-		errs = append(errs, errors.New(`run is required, e.g. run = "myapp"`))
-	} else if argv, err := app.SplitCommand(*r.Run); err != nil {
-		errs = append(errs, fmt.Errorf("run: %w", err))
-	} else if err := checkRelPath(argv[0]); err != nil {
-		errs = append(errs, fmt.Errorf("run: %w", err))
-	} else {
-		m.Run = argv
+	if r.Package != nil {
+		if err := checkPackage(*r.Package); err != nil {
+			errs = append(errs, err)
+		} else {
+			m.Package = *r.Package
+		}
+	}
+
+	if r.Args != nil {
+		for _, a := range *r.Args {
+			if strings.ContainsRune(a, 0) {
+				errs = append(errs, errors.New("args must not contain NUL characters"))
+				break
+			}
+		}
+		m.Args = *r.Args
 	}
 
 	if r.HealthPath != nil {
@@ -104,13 +140,22 @@ func Parse(b []byte) (*Manifest, error) {
 	return m, nil
 }
 
-// checkRelPath requires a clean path relative to the app root.
-func checkRelPath(p string) error {
-	if filepath.IsAbs(p) {
-		return fmt.Errorf("binary path %q must be relative to the tarball root", p)
+// checkPackage requires one local main package: "." or "./sub/dir",
+// staying inside the repository, without patterns or flags.
+func checkPackage(p string) error {
+	bad := func(why string) error {
+		return fmt.Errorf(`package %q %s (examples: ".", "./cmd/web")`, p, why)
 	}
-	if c := filepath.Clean(p); c == ".." || strings.HasPrefix(c, "../") {
-		return fmt.Errorf("binary path %q must stay inside the release", p)
+	switch {
+	case p != "." && !strings.HasPrefix(p, "./"):
+		return bad("must start with \".\"")
+	case strings.Contains(p, "..."):
+		return bad("must name one package, not a pattern")
+	case strings.ContainsAny(p, " \t\r\n\\\x00"):
+		return bad("must not contain spaces or backslashes")
+	}
+	if c := path.Clean(p); c == ".." || strings.HasPrefix(c, "../") {
+		return bad("must stay inside the repository")
 	}
 	return nil
 }

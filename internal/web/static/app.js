@@ -1,4 +1,4 @@
-// goboat dashboard: live log streams, status refresh and confirmations.
+// goboat dashboard: live log streams, status refresh, branch lists and confirmations.
 // Everything also works without JavaScript except the live parts.
 "use strict";
 
@@ -44,6 +44,30 @@ function refresh(el) {
   }, every);
 }
 
+// <input data-branches="list-id"> (a repository): fill the datalist with
+// its branches, and an empty branch field next to it with the default.
+function branches(input) {
+  const list = document.getElementById(input.dataset.branches);
+  const field = input.form && input.form.elements.namedItem("branch");
+  if (!list) return;
+  let last = "";
+  const load = async () => {
+    const repo = input.value.trim();
+    if (!repo || repo === last) return;
+    last = repo;
+    try {
+      const r = await fetch("/github/branches?repo=" + encodeURIComponent(repo), { credentials: "same-origin" });
+      if (!r.ok) return;
+      const data = await r.json();
+      list.replaceChildren(...data.branches.map((b) => { const o = document.createElement("option"); o.value = b; return o; }));
+      if (field && !field.value && field.placeholder) field.placeholder = data.default + " (default branch)";
+    } catch (_) { /* typing a branch by hand still works */ }
+  };
+  input.addEventListener("change", load);
+  input.addEventListener("blur", load);
+  load();
+}
+
 function wire(root) {
   root.querySelectorAll("form[data-confirm]").forEach((f) => {
     f.addEventListener("submit", (e) => { if (!confirm(f.dataset.confirm)) e.preventDefault(); });
@@ -56,5 +80,6 @@ function wire(root) {
 document.addEventListener("DOMContentLoaded", () => {
   document.querySelectorAll("pre[data-stream]").forEach(stream);
   document.querySelectorAll("[data-refresh][id]").forEach(refresh);
+  document.querySelectorAll("input[data-branches]").forEach(branches);
   wire(document);
 });
