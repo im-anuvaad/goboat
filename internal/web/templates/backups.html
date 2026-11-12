@@ -1,0 +1,28 @@
+{{define "content"}}
+{{$csrf := .CSRF}}
+{{with .Data}}
+<section class="card">
+  <div class="row">
+    <h1>Backups of {{.Name}}</h1>
+    <a class="button" href="/apps/{{.Name}}#backups">Back to {{.Name}}</a>
+  </div>
+  <p class="muted">{{.Count}} backup(s), taken {{.Policy}} (skipped when nothing changed), before every deploy, and on request.</p>
+  {{range .Days}}
+  <h2>{{.Day}}</h2>
+  <table class="stack">
+    <thead><tr><th>#</th><th>Taken</th><th>Kind</th><th>Status</th><th>Size</th><th>Where</th><th>Commit</th><th></th></tr></thead>
+    <tbody>{{range .Backups}}
+    <tr>
+      <td data-label="#">#{{.ID}}</td><td class="nowrap" data-label="Taken">{{datetime .CreatedAt}} <small class="muted">{{ago .CreatedAt}}</small></td><td data-label="Kind">{{.Kind}}</td>
+      <td data-label="Status">{{if eq .Status "ok"}}<span class="badge s-running">ok</span>{{else}}{{template "state" .Status}}{{end}}{{with .Error}} <small class="error-text">{{.}}</small>{{end}}</td>
+      <td data-label="Size">{{bytes .Size}}</td>
+      <td data-label="Where">{{if .Uploaded}}bucket{{end}}{{if and .Uploaded .LocalPath}} + {{end}}{{if .LocalPath}}server{{end}}</td>
+      <td data-label="Commit">{{if .GitSHA}}<code>{{short .GitSHA}}</code>{{else}}<span class="muted">-</span>{{end}}</td>
+      <td class="end">{{if .Restorable}}<form method="post" action="/apps/{{$.Data.Name}}/restore" class="inline" data-confirm="Restore backup #{{.ID}} from {{datetime .CreatedAt}}? The app is stopped briefly; its current databases are moved to a .pre-restore folder.">{{template "csrf" $csrf}}<input type="hidden" name="id" value="{{.ID}}"><button>Restore</button></form>{{end}}</td>
+    </tr>{{end}}
+    </tbody>
+  </table>
+  {{else}}<p class="muted">No backups yet.</p>{{end}}
+</section>
+{{end}}
+{{end}}

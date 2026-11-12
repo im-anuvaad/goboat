@@ -150,3 +150,21 @@ func fileSHA256(path string) (string, int64, error) {
 	n, err := io.Copy(h, f)
 	return hex.EncodeToString(h.Sum(nil)), n, err
 }
+
+// Fingerprint describes the state of the databases dbs (paths relative to
+// dataDir): size and modification time of each database and its WAL. Any
+// write changes one of them; a checkpoint may too, which only costs an
+// extra backup.
+func Fingerprint(dataDir string, dbs []string) string {
+	h := sha256.New()
+	for _, rel := range dbs {
+		for _, p := range []string{rel, rel + "-wal"} {
+			if st, err := os.Stat(filepath.Join(dataDir, p)); err == nil {
+				fmt.Fprintf(h, "%s %d %d\n", p, st.Size(), st.ModTime().UnixNano())
+			} else {
+				fmt.Fprintf(h, "%s -\n", p)
+			}
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
