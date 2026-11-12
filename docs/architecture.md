@@ -155,7 +155,7 @@ Every object goboat creates at Cloudflare is either in use (recorded in `edge_ho
 ## 6. Apps and processes
 
 - **Names** come from the repository name: lowercased, `_`/`.` → `-`, 2–24 chars `a-z0-9-`, starting with a letter. One repo = one app. Ports are assigned once from 20001 up.
-- **Add app** form: repository (with suggestions from the GitHub token), branch (the repository's branches, default branch preselected), domain (required), memory and CPU (drop-downs, §6.1), the backup folder to start from (§8). The form shows how much memory all apps together are allowed to use against the server's RAM and warns above 75 %.
+- **Add app** form: repository (with suggestions from the GitHub token), branch (the repository's branches, filled in by `app.js`; empty = the default branch), domain (required: "the domain is missing: enter the domain the app will be served on"), memory and CPU (drop-downs, §6.1), the backup folder to start from (§8). The form shows how much memory all apps' limits add up to against the server's RAM; creating an app or changing a limit that takes the total above 75 % adds a note to the confirmation.
 - **Users:** `goboat-<app>` (system, no home, `nologin`); `data/` and `tmp/` 0700 owned by it; builds root-owned; other apps' and goboat's files unreadable. Builds run as `goboatbuild` (§7.3), which no app name can collide with.
 - **cgroups:** goboat owns `system.slice/goboat.service/` (`Delegate=yes`), moves itself into `supervisor/`, apps run in `apps/<app>/`, builds in `builds/`. Apps get `memory.max`, `memory.swap.max=0`, `memory.zswap.max=0`, `cpu.max`, `pids.max` 256; no `memory.high`; `RLIMIT_NOFILE` 4096 via prlimit. Processes start inside their cgroup (`CLONE_INTO_CGROUP`) with the app's uid/gid, `Setpgid`, `Pdeathsig=SIGKILL`, cwd = the build's `src/`, a clean env (`PATH`, `LANG`, contract vars, user env, and `GOMEMLIMIT` = 90 % of `memory.max` unless the user sets one). Killing = SIGKILL every PID in the cgroup until empty, **never `cgroup.kill`** (D8). `memory.events` OOM kills are recorded.
 - **Supervisor:** `stopped → starting → running → stopping`, plus `crashed`, `deploying`. Running = TCP connect then `GET health_path` 2xx/3xx within 30 s. Stop = SIGTERM, 10 s, kill the cgroup. Restarts with backoff 1 s → 60 s; 5 exits in 5 min → `crashed` until the user starts it. At start, apps with desired state `running` start one at a time.
@@ -172,7 +172,7 @@ Every object goboat creates at Cloudflare is either in use (recorded in `edge_ho
 | Processes | fixed 256 | |
 | Open files | fixed 4096 | |
 
-The dashboard is the only source of limits (D23): `goboat.toml` has no limit keys and rejects them with a message pointing to the app's Settings.
+The dashboard is the only source of limits (D23): `goboat.toml` has no limit keys and rejects them with a message pointing to the app's Settings. Only the values above are accepted from the forms; an app whose limit was set before the choices existed keeps it (shown as "(current)") until it is changed. A running app keeps its old limits until it restarts: saving says so, and the app page shows "Restart to apply" until then.
 
 ## 7. Builds and deploys
 
@@ -213,6 +213,7 @@ A failure in 2–6 never touches the running app, and errors name the cause (com
 - `GOCACHE` trims itself (entries unused for 5 days). Before a build, if `cache/mod` is over 5 GB, it is emptied (`go clean -modcache`); the next build downloads what it needs again.
 - The Go version used (read from the built binary, so it is the toolchain after `GOTOOLCHAIN` switching) is stored with the build and shown on the app page.
 - A build killed by the memory limit (an `oom_kill` in its cgroup's `memory.events`) fails with "the build ran out of memory"; a build over 15 minutes, with "took longer than 15 minutes". Leftover processes are killed with the cgroup either way.
+- The deployment records the build's wall time, CPU time (`cpu.stat`), peak memory and peak swap; the deployment page shows them, the swap in a warning colour when it was used.
 
 Measured on a 2 vCPU / 1.9 GB VPS with two apps running (deploy log figures):
 
@@ -249,7 +250,7 @@ During every one of these builds a running app answered its health check through
 
 ## 9. Monitoring
 
-Every 10 s: host (`/proc/stat`, `/proc/meminfo` including swap, `/proc/loadavg`, `statfs`), goboat itself (`/proc/self`), each app (`cpu.stat`, `memory.current`, `pids.current`, `io.stat`, `memory.events`) and proxy counters (requests, 5xx, p50/p95 from a fixed histogram 5 ms … 10 s). CPU and I/O are counter deltas. 1 h of samples in memory (360 per scope); each minute is rolled up into `metrics_1m`, pruned after 7 days. Charts are SVGs rendered by goboat (`/charts?scope=&chart=&range=1h|24h|7d`). Warnings (dashboard only): disk > 85 %, memory > 90 %, swap in use outside builds, OOM kill in the last hour, app > 90 % of its memory limit, crashed, backup failed or local only, backup slot skipped, Cloudflare cleanup failing, cert expiring < 14 days, restart needed, setup step missing.
+Every 10 s: host (`/proc/stat`, `/proc/meminfo` including swap, `/proc/loadavg`, `statfs`), goboat itself (`/proc/self`), each app (`cpu.stat`, `memory.current`, `pids.current`, `io.stat`, `memory.events`) and proxy counters (requests, 5xx, p50/p95 from a fixed histogram 5 ms … 10 s). CPU and I/O are counter deltas. 1 h of samples in memory (360 per scope); each minute is rolled up into `metrics_1m`, pruned after 7 days. Charts are SVGs rendered by goboat (`/charts?scope=&chart=&range=1h|24h|7d`). Warnings (dashboard only): disk > 85 %, memory > 90 %, 64 MB or more written to swap (`pswpout` in `/proc/vmstat`) in the last hour while no build was running or had ended within a minute (swap-ins are not counted: they are pages coming back after a build), OOM kill in the last hour, app > 90 % of its memory limit, crashed, backup failed or local only, backup slot skipped, Cloudflare cleanup failing, cert expiring < 14 days, restart needed, setup step missing.
 
 ## 10. Moving to another server
 
