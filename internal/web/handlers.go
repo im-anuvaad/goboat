@@ -197,6 +197,11 @@ func (s *Server) warnings(r *http.Request, rows []AppRow) []string {
 				ws = append(ws, h.Host+": "+h.Error)
 			}
 		}
+		for _, c := range st.Cleanup {
+			if c.Failing(24 * time.Hour) {
+				ws = append(ws, "Cloudflare cleanup has been failing for "+ago(c.CreatedAt)+": "+c.What()+": "+c.LastError+" (Settings → Cloudflare → Cleanup pending).")
+			}
+		}
 	}
 	if _, ok, _ := s.Store.GetSetting(ctx, deployer.SettingGitHubToken); !ok {
 		ws = append(ws, "No GitHub token is set, so only public repositories can be deployed. Add one in Settings → GitHub.")
@@ -715,6 +720,13 @@ func (s *Server) edgeSync(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	_, err := s.Edge.Sync(ctx)
 	redirect(w, r, "/settings", err, "Cloudflare sync finished without errors.")
+}
+
+func (s *Server) revokeCert(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	err := s.Edge.RevokeUnused(ctx, r.PostFormValue("id"))
+	redirect(w, r, "/settings#unused", err, "Certificate revoked.")
 }
 
 func (s *Server) sslStrict(w http.ResponseWriter, r *http.Request) {

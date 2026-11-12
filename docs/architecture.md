@@ -85,9 +85,9 @@ All components are goroutines in one process (the systemd unit), talking through
 | `builds` | the kept builds (at most 3 per app): id (first 12 hex digits of the commit), commit SHA, branch, commit subject, Go version used, `goboat.toml` values (package, args, health path), binary size, build time |
 | `deployments` | history: kind (deploy, rollback, move), build id, commit, branch, status (queued, building, deploying, succeeded, failed), error, times; a failed build is a failed deployment with the compiler output in its log |
 | `backups` | kind, status, object key, local path, size, sha256, per-database fingerprint, commit, error |
-| `edge_hosts` | per host: zone id, Origin CA cert id, expiry, DNS record ids (A, AAAA) |
-| `edge_zones` | per zone: SSL mode, AOP cert id/serial, AOP enforced |
-| `cf_cleanup` | Cloudflare objects to delete: kind (origin cert, AOP cert, DNS record, zone AOP setting), zone, object id, host, reason, attempts, last error, created |
+| `edge_certs` | per served host: zone id, Origin CA cert id, expiry |
+| `edge_zones` | per zone: SSL mode, AOP cert id/serial (saved right after the upload), AOP enforced |
+| `cf_cleanup` | Cloudflare objects to delete (§5.6): kind (`host`, `aop_cert`, `zone`), zone, host, object id, the server's addresses at removal, reason, attempts, last error, created, last try |
 | `metrics_1m` | 7 days of 1-minute rollups per scope (`_host`, `_goboat`, app) |
 
 `*` sealed with AES-256-GCM (`master.key`), purpose-bound (`settings:cloudflare_token`, `app_env:<app>:<NAME>` …), never shown in the UI. Migrations are numbered, one transaction each; a failing one rolls back and goboat refuses to start; a schema newer than the binary is refused naming both versions. goboat refuses to start if `master.key` is group/other-accessible or malformed.
@@ -135,22 +135,27 @@ The IP filter only proves "some Cloudflare account"; zone-level AOP with goboat'
 `Host` (lowercased, port removed) → dashboard, an app's `httputil.ReverseProxy` to `127.0.0.1:<port>`, or 404; `Host` must equal the SNI or 421. The proxy replaces `X-Forwarded-For`/`X-Real-IP` with `CF-Connecting-IP`, sets `X-Forwarded-Proto: https` and `X-Forwarded-Host`, keeps `Host`, flushes immediately (`FlushInterval: -1`; SSE, long-poll, WebSockets work), dials with a 5 s timeout. Switching builds → 503 (`Retry-After: 3`), starting → 503, stopped/crashed/never deployed → 503, proxy error → 502; goboat pages carry `X-Goboat-Page` and `no-store`. Per-app counters (requests, status classes, latency histogram) feed monitoring.
 
 ### 5.5 Cloudflare token, DNS, domains
-Token permissions: Zone Read, DNS Edit, SSL and Certificates Edit, Zone Settings Edit; saving it verifies it, lists readable zones and names missing permissions. For each domain: zone by longest suffix (a domain in no zone is refused when saved), proxied `A` (+ `AAAA` if the server has IPv6) created or updated, **their record ids saved in `edge_hosts`**; conflicting CNAMEs or duplicates are reported, never touched. Edge sync is best effort per host. Public IPv4/IPv6 are detected via `https://www.cloudflare.com/cdn-cgi/trace`. The dashboard domain (needs the token, can't be an app's domain) is routed at once and set up in the background; sessions are per domain.
+Token permissions: Zone Read, DNS Edit, SSL and Certificates Edit, Zone Settings Edit; saving it verifies it, lists readable zones and names missing permissions. For each domain: zone by longest suffix (a domain in no zone is refused when saved), proxied `A` (+ `AAAA` if the server has IPv6) created or updated in place; conflicting CNAMEs or duplicates are reported, never touched. Edge sync is best effort per host. Public IPv4/IPv6 are detected via `https://www.cloudflare.com/cdn-cgi/trace`. The dashboard domain (needs the token, can't be an app's domain) is routed at once and set up in the background; sessions are per domain.
 
 **Every app has a domain** (D21): Add app refuses to create an app without one ("Enter the domain the app will be served on"). The app's Settings can change the domain but not clear it.
 
 ### 5.6 Cloudflare cleanup
-Every object goboat creates at Cloudflare is either in use (recorded in `edge_hosts`/`edge_zones`) or queued for deletion in `cf_cleanup`. Nothing is forgotten when an API call fails.
+Every object goboat creates at Cloudflare is either in use (a served hostname's DNS records and certificate, a zone's current AOP certificate) or queued in `cf_cleanup` until Cloudflare confirms it is gone. Nothing is forgotten when an API call fails or goboat restarts half-way.
 
-- **Removing a host** (app deleted, domain changed, dashboard domain changed) moves its Origin CA cert id and DNS record ids from `edge_hosts` into `cf_cleanup` in **one transaction**, deletes the local cert files, removes the route, and starts a background sync. The request never waits for Cloudflare, and the lock it takes respects its context.
-- **Every sync works through `cf_cleanup` first**: revoke the Origin CA cert, delete the DNS record (only if it still points to one of this server's addresses), delete the AOP cert, or turn zone AOP off. Success or 404 removes the row; any other error is kept on the row with an attempt count and retried on the next sync.
-- **Reconciliation per zone goboat serves**, on every sync, from what Cloudflare reports:
-  - *Origin CA*: `GET /certificates?zone_id=`. Every non-revoked cert whose hostnames include a host goboat serves, and which is not that host's current cert, is revoked. This catches certs whose id was never saved (a crash between issue and save) and certs left by an earlier install for the same hostname.
-  - *AOP*: `GET /zones/<z>/origin_tls_client_auth`. Every zone-level cert other than goboat's current one is deleted.
-- **When the last goboat host leaves a zone**, goboat's AOP cert and the zone AOP setting go to `cf_cleanup` (cert deleted, AOP turned off) and the zone's `edge_zones` row is removed. Re-adding a host later starts the zone from scratch (upload, 10-minute rollout).
-- **Other certificates in a served zone** (Origin CA certs for hostnames goboat doesn't serve) are listed under **Settings → Cloudflare → Unused certificates** with the hostname and issue date and a **Revoke** button each. goboat never revokes them by itself: they may belong to another origin.
+- **Removing a hostname** (app deleted, domain changed, dashboard domain changed) queues a `host` item and forgets its certificate record in **one transaction**, deletes the local certificate files and starts a background sync. It never calls Cloudflare and never waits for a running sync.
+- **Every sync works through the queue first**, then syncs the served hostnames and zones:
+  - `host`: delete the hostname's A/AAAA records **whose content is one of this server's addresses** (at removal or now; after a server move they point elsewhere and are left alone), and revoke every Origin CA certificate for exactly that hostname. Skipped (and dropped) if the hostname is served again.
+  - `aop_cert`: delete a replaced zone-level AOP certificate, but only once the current one is active.
+  - `zone`: when no configured hostname is in a zone any more: turn zone-level AOP off, delete the AOP certificates there and forget the zone.
+  - Success or 404 removes the item; any other error is stored on it with an attempt count, and the whole sync is retried after 1, 5 and 15 minutes, then every 6 hours.
+- **Comparison with Cloudflare per zone goboat serves**, on every sync:
+  - *Origin CA* (`GET /certificates?zone_id=`, which lists non-revoked certificates with their PEM): a certificate for exactly one served hostname whose serial differs from the installed one is revoked. This catches certificates whose id was never saved and those of earlier installs.
+  - *AOP* (`GET /zones/<z>/origin_tls_client_auth`): once goboat's certificate is active, every other zone-level certificate is deleted (D24).
+  - Certificates for hostnames goboat doesn't serve are listed under **Settings → Cloudflare → Unused certificates** with a **Revoke** button each. goboat never revokes them by itself: they may belong to another origin.
+- **Configured hostnames are never cleaned up**, even when not routed: the list comes from the database (every app's domain and the dashboard domain), so an app that fails to load keeps its DNS record and certificate. If that list can't be read, the sync does no cleanup at all; zones are released only when every configured hostname's zone is known.
+- A certificate record for a hostname that is not configured (a sync racing a removal, or a removal by an older goboat) is turned into a `host` item.
 - goboat never orders edge certificates. The Universal SSL certificate packs Cloudflare shows under Edge Certificates (an active one and a backup) are Cloudflare's own.
-- **Settings → Cloudflare** shows pending cleanup items with their last error; the home page warns when one has failed for over 24 hours.
+- **Settings → Cloudflare → Cleanup pending** shows queued items with their last error; the home page warns when one has failed for over 24 hours.
 
 ## 6. Apps and processes
 

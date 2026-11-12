@@ -113,6 +113,7 @@ func (s *Server) Handler() (http.Handler, error) {
 	authed("POST /settings/cloudflare-token", s.setCloudflareToken)
 	authed("POST /settings/edge-sync", s.edgeSync)
 	authed("POST /settings/ssl-strict", s.sslStrict)
+	authed("POST /settings/revoke-cert", s.revokeCert)
 	authed("GET /account", s.accountPage)
 	authed("POST /account/email", s.changeEmail)
 	authed("POST /account/password", s.changePassword)

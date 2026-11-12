@@ -57,7 +57,16 @@ type Config struct {
 	DataRoot string
 	// SetupPending reports whether a one-time password is pending.
 	SetupPending func() bool
+	// KnownHosts lists every configured hostname (all apps' domains, also
+	// of apps that failed to load). Cleanup never touches these. nil = only
+	// the routed hosts count.
+	KnownHosts func(ctx context.Context) ([]string, error)
+	// CloudflareBase overrides the Cloudflare API (tests).
+	CloudflareBase string
 }
+
+// Retries after a sync that left something undone (a host, a cleanup).
+var syncRetries = []time.Duration{time.Minute, 5 * time.Minute, 15 * time.Minute}
 
 // Manager owns certificates, Cloudflare state and the listener.
 type Manager struct {
@@ -89,7 +98,13 @@ type Manager struct {
 	lastIPs   time.Time
 	pubV4     string
 	pubV6     string
+	unused    []UnusedCert
+	retry     int
+	retryT    *time.Timer
 }
+
+// SetKnownHosts sets Config.KnownHosts (before Run).
+func (m *Manager) SetKnownHosts(f func(ctx context.Context) ([]string, error)) { m.cfg.KnownHosts = f }
 
 type hostEntry struct {
 	Host string
@@ -121,19 +136,21 @@ type ZoneStatus struct {
 
 // Status is a snapshot for the settings page.
 type Status struct {
-	Listen      string       `json:"listen"`
-	Dashboard   string       `json:"dashboard_host"`
-	TokenSet    bool         `json:"cloudflare_token_set"`
-	PublicIPv4  string       `json:"public_ipv4"`
-	PublicIPv6  string       `json:"public_ipv6"`
-	IPRanges    int          `json:"ip_ranges"`
-	IPSource    string       `json:"ip_ranges_source"`
-	Rejected    int64        `json:"rejected_connections"`
-	LastSync    time.Time    `json:"last_sync"`
-	LastError   string       `json:"last_error,omitempty"`
-	Hosts       []HostStatus `json:"hosts"`
-	Zones       []ZoneStatus `json:"zones"`
-	AOPClientTo time.Time    `json:"aop_client_not_after"`
+	Listen      string        `json:"listen"`
+	Dashboard   string        `json:"dashboard_host"`
+	TokenSet    bool          `json:"cloudflare_token_set"`
+	PublicIPv4  string        `json:"public_ipv4"`
+	PublicIPv6  string        `json:"public_ipv6"`
+	IPRanges    int           `json:"ip_ranges"`
+	IPSource    string        `json:"ip_ranges_source"`
+	Rejected    int64         `json:"rejected_connections"`
+	LastSync    time.Time     `json:"last_sync"`
+	LastError   string        `json:"last_error,omitempty"`
+	Hosts       []HostStatus  `json:"hosts"`
+	Zones       []ZoneStatus  `json:"zones"`
+	AOPClientTo time.Time     `json:"aop_client_not_after"`
+	Cleanup     []CleanupItem `json:"cleanup"`
+	Unused      []UnusedCert  `json:"unused_certificates"`
 }
 
 // NewManager loads certificates, the AOP CA and saved Cloudflare state so
@@ -490,7 +507,7 @@ func (m *Manager) Run(ctx context.Context) {
 }
 
 func (m *Manager) client(token string) *cloudflare.Client {
-	return &cloudflare.Client{Token: token}
+	return &cloudflare.Client{Token: token, Base: m.cfg.CloudflareBase}
 }
 
 func (m *Manager) refreshIPs(ctx context.Context) {
@@ -588,6 +605,19 @@ func (m *Manager) Sync(ctx context.Context) (Status, error) {
 	if err != nil {
 		m.lastErr = err.Error()
 	}
+	// Something was left undone: try again soon instead of in 6 hours.
+	if m.retryT != nil {
+		m.retryT.Stop()
+		m.retryT = nil
+	}
+	if err == nil {
+		m.retry = 0
+	} else if m.retry < len(syncRetries) {
+		d := syncRetries[m.retry]
+		m.retry++
+		m.retryT = time.AfterFunc(d, m.SyncInBackground)
+		m.log.Info("the Cloudflare sync left something undone; trying again", "in", d)
+	}
 	m.mu.Unlock()
 	return m.Status(ctx), err
 }
@@ -617,7 +647,24 @@ func (m *Manager) sync(ctx context.Context) error {
 	}
 
 	var errs []error
+	known, trusted := m.knownHosts(ctx, hosts)
+	oc := &originCache{c: c, zones: map[string][]cloudflare.OriginCert{}}
+
+	// 1. Cleanup first, so a hostname removed and added again ends with
+	// one certificate.
+	if trusted {
+		if err := m.forgetOrphans(ctx, known); err != nil {
+			errs = append(errs, err)
+		}
+		if err := m.cleanHosts(ctx, c, oc, known, v4, v6); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	// 2. Every served hostname: DNS records and certificate.
 	zones := map[string]cloudflare.Zone{}
+	served := map[string]bool{} // zone ids of configured hostnames
+	complete := trusted
 	for _, h := range hosts {
 		hs := &HostStatus{Host: h.Host, App: h.App}
 		if err := m.syncHost(ctx, c, h, v4, v6, hs, zones); err != nil {
@@ -626,11 +673,54 @@ func (m *Manager) sync(ctx context.Context) error {
 		}
 		m.mu.Lock()
 		m.hostState[h.Host] = hs
+		if z := m.hostZone[h.Host]; z != "" {
+			served[z] = true
+		} else {
+			complete = false
+		}
 		m.mu.Unlock()
 	}
+	// Configured but not routed (an app that failed to load): keep its zone.
+	routed := map[string]bool{}
+	for _, h := range hosts {
+		routed[h.Host] = true
+	}
+	m.mu.RLock()
+	for h := range known {
+		if !routed[h] {
+			if z := m.hostZone[h]; z != "" {
+				served[z] = true
+			} else {
+				complete = false
+			}
+		}
+	}
+	m.mu.RUnlock()
+
+	// 3. Every zone: SSL mode, AOP, and a comparison with Cloudflare's lists.
+	var unused []UnusedCert
 	for _, z := range zones {
-		if err := m.syncZone(ctx, c, z, aop); err != nil {
+		ready, err := m.syncZone(ctx, c, z, aop)
+		if err != nil {
 			errs = append(errs, fmt.Errorf("zone %s: %w", z.Name, err))
+		}
+		if !trusted {
+			continue
+		}
+		u, err := m.reconcileZone(ctx, c, oc, z, known, ready)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("zone %s: %w", z.Name, err))
+		}
+		unused = append(unused, u...)
+	}
+	m.mu.Lock()
+	m.unused = unused
+	m.mu.Unlock()
+
+	// 4. Zones without goboat hostnames: AOP off, our certificate deleted.
+	if complete {
+		if err := m.releaseZones(ctx, c, served); err != nil {
+			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
@@ -715,14 +805,17 @@ func (m *Manager) issue(ctx context.Context, c *cloudflare.Client, host, zoneID 
 	}
 	if oldID != "" && oldID != oc.ID {
 		if err := c.RevokeOriginCert(ctx, oldID); err != nil && !cloudflare.IsNotFound(err) {
-			m.log.Warn("revoking the replaced Origin CA certificate failed", "host", host, "id", oldID, "err", err)
+			// The next sync's comparison with Cloudflare's list revokes it.
+			m.log.Warn("revoking the replaced Origin CA certificate failed; the next sync retries", "host", host, "id", oldID, "err", err)
 		}
 	}
 	m.log.Info("certificate installed", "host", host, "not_after", leaf.NotAfter.Format(time.DateOnly))
 	return nil
 }
 
-func (m *Manager) syncZone(ctx context.Context, c *cloudflare.Client, z cloudflare.Zone, aop *AOP) error {
+// syncZone checks a zone's SSL mode and AOP. aopReady reports whether
+// goboat's AOP certificate is active there (or AOP is off).
+func (m *Manager) syncZone(ctx context.Context, c *cloudflare.Client, z cloudflare.Zone, aop *AOP) (aopReady bool, _ error) {
 	m.mu.RLock()
 	prev := m.zoneState[z.ID]
 	m.mu.RUnlock()
@@ -760,8 +853,10 @@ func (m *Manager) syncZone(ctx context.Context, c *cloudflare.Client, z cloudfla
 	}
 
 	enforced := false
+	aopReady = !m.cfg.AOP
 	if m.cfg.AOP {
 		ready, changed, err := m.syncAOP(ctx, c, z, aop, zs)
+		aopReady = ready
 		switch {
 		case err != nil:
 			errs = append(errs, fmt.Errorf("authenticated origin pulls: %w", err))
@@ -796,7 +891,7 @@ func (m *Manager) syncZone(ctx context.Context, c *cloudflare.Client, z cloudfla
 	m.zoneState[z.ID] = zs
 	m.enforce[z.ID] = enforced
 	m.mu.Unlock()
-	return errors.Join(errs...)
+	return aopReady, errors.Join(errs...)
 }
 
 func (m *Manager) enforceFor(zoneID string) bool {
@@ -822,9 +917,8 @@ func (m *Manager) syncAOP(ctx context.Context, c *cloudflare.Client, z cloudflar
 			return false, false, err
 		}
 	}
-	oldID := ""
 	if zs.AOPCertID == "" || zs.AOPSerial != serial {
-		oldID = zs.AOPCertID
+		oldID := zs.AOPCertID
 		up, err := c.UploadAOPCert(ctx, z.ID, string(aop.ClientPEM), string(aop.ClientKey))
 		if err != nil {
 			return false, false, err
@@ -832,6 +926,24 @@ func (m *Manager) syncAOP(ctx context.Context, c *cloudflare.Client, z cloudflar
 		zs.AOPCertID, zs.AOPSerial = up.ID, serial
 		changed = true
 		m.log.Info("uploaded AOP client certificate", "zone", z.Name, "id", up.ID)
+		// Saved at once (not enforced yet), so a restart during the wait
+		// below doesn't upload it again; the previous one is deleted once
+		// this one is active.
+		if _, err := m.store.Writer().ExecContext(ctx, `INSERT INTO edge_zones (zone_id, name, aop_cert_id, aop_cert_serial, aop_active, checked_at)
+			VALUES (?, ?, ?, ?, 0, ?) ON CONFLICT (zone_id) DO UPDATE SET aop_cert_id = excluded.aop_cert_id,
+			aop_cert_serial = excluded.aop_cert_serial, aop_active = 0`, z.ID, z.Name, up.ID, serial, time.Now().Unix()); err != nil {
+			m.log.Warn("saving the uploaded AOP certificate id", "err", err)
+		}
+		m.mu.Lock()
+		if cur := m.zoneState[z.ID]; cur != nil {
+			cur.AOPCertID, cur.AOPSerial = up.ID, serial
+		} else {
+			m.zoneState[z.ID] = &ZoneStatus{ID: z.ID, Name: z.Name, AOPCertID: up.ID, AOPSerial: serial}
+		}
+		m.mu.Unlock()
+		if oldID != "" {
+			enqueue(ctx, m.store.Writer(), cleanAOPCert, z.ID, "", oldID, "", "replaced")
+		}
 	}
 	if err := m.waitAOPActive(ctx, c, z.ID, zs.AOPCertID); err != nil {
 		return false, changed, err
@@ -846,11 +958,6 @@ func (m *Manager) syncAOP(ctx context.Context, c *cloudflare.Client, z cloudflar
 		}
 		changed = true
 		m.log.Info("enabled zone-level authenticated origin pulls", "zone", z.Name)
-	}
-	if oldID != "" && oldID != zs.AOPCertID {
-		if err := c.DeleteAOPCert(ctx, z.ID, oldID); err != nil && !cloudflare.IsNotFound(err) {
-			m.log.Warn("deleting the previous AOP certificate failed", "zone", z.Name, "id", oldID, "err", err)
-		}
 	}
 	return true, changed, nil
 }
@@ -997,8 +1104,10 @@ func (m *Manager) Status(ctx context.Context) Status {
 	ranges, src := m.Filter.Ranges()
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	cleanup := m.Cleanup(ctx)
 	s := Status{
-		Listen: m.cfg.Listen, Dashboard: m.dashHost, TokenSet: tokErr == nil,
+		Cleanup: cleanup,
+		Listen:  m.cfg.Listen, Dashboard: m.dashHost, TokenSet: tokErr == nil,
 		PublicIPv4: m.pubV4, PublicIPv6: m.pubV6, IPRanges: len(ranges), IPSource: src,
 		Rejected: m.Filter.Rejected(), LastSync: m.lastSync, LastError: m.lastErr,
 		AOPClientTo: m.aop.Client.NotAfter,
@@ -1018,6 +1127,7 @@ func (m *Manager) Status(ctx context.Context) Status {
 		s.Zones = append(s.Zones, *z)
 	}
 	sort.Slice(s.Zones, func(i, j int) bool { return s.Zones[i].Name < s.Zones[j].Name })
+	s.Unused = append([]UnusedCert(nil), m.unused...)
 	return s
 }
 
@@ -1094,51 +1204,4 @@ func (m *Manager) SyncInBackground() {
 			m.log.Warn("cloudflare sync failed", "err", err)
 		}
 	}()
-}
-
-// RemoveHost cleans up a hostname that is no longer served: it deletes the
-// A/AAAA records that point at this server, revokes the Origin CA
-// certificate and removes the local copy. AOP stays on for the zone.
-func (m *Manager) RemoveHost(ctx context.Context, host string) error {
-	m.syncMu.Lock()
-	defer m.syncMu.Unlock()
-	var errs []error
-	m.mu.Lock()
-	zoneID := m.hostZone[host]
-	delete(m.hostZone, host)
-	delete(m.hostState, host)
-	v4, v6 := m.pubV4, m.pubV6
-	m.mu.Unlock()
-
-	var certID string
-	m.store.Reader().QueryRowContext(ctx, `SELECT cf_cert_id FROM edge_certs WHERE hostname = ?`, host).Scan(&certID)
-	if token, err := m.token(ctx); err == nil && zoneID != "" {
-		c := m.client(token)
-		if rs, err := c.DNSRecords(ctx, zoneID, host); err != nil {
-			errs = append(errs, fmt.Errorf("DNS: %w", err))
-		} else {
-			for _, r := range rs {
-				if (r.Type == "A" && r.Content == v4) || (r.Type == "AAAA" && r.Content == v6) {
-					if err := c.DeleteDNSRecord(ctx, zoneID, r.ID); err != nil {
-						errs = append(errs, fmt.Errorf("DNS: %w", err))
-					}
-				}
-			}
-		}
-		if certID != "" {
-			if err := c.RevokeOriginCert(ctx, certID); err != nil && !cloudflare.IsNotFound(err) {
-				errs = append(errs, fmt.Errorf("revoke certificate: %w", err))
-			}
-		}
-	} else if err != nil {
-		errs = append(errs, fmt.Errorf("DNS record and certificate left in Cloudflare: %w", err))
-	}
-	if _, err := m.store.Writer().ExecContext(ctx, `DELETE FROM edge_certs WHERE hostname = ?`, host); err != nil {
-		errs = append(errs, err)
-	}
-	m.Certs.Delete(host)
-	if len(errs) == 0 {
-		m.log.Info("removed hostname", "host", host)
-	}
-	return errors.Join(errs...)
 }

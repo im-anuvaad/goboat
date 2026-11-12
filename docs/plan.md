@@ -46,13 +46,20 @@ Behaviour stays as it is (release-based deploys still work), so the rename can b
 - Result (VPS 1, `v0.0.3-rc1`): an app without a domain and limits outside the choices are refused with those messages; removing a domain in Settings is refused; 512 MB / 0.5 cores saved on a running app left the cgroup at 256 MB / 1 core until **Restart to apply**, then `memory.max` = 536870912, `cpu.max` = `50000 100000`, `GOMEMLIMIT` = 90 % of it; the 75 % note appeared at 94 %; the deployment page shows build time, CPU time and peaks; a 1.9 GB memory hog outside goboat raised the swap warning.
 - The database keeps a partial unique index on the domain (empty values allowed) so apps created before this phase still load; the rule is enforced by the forms.
 
-## Phase 4: Cloudflare cleanup (quirk D)
+## Phase 4: Cloudflare cleanup (quirk D) (done)
 
 - `edge_hosts` with DNS record ids, `cf_cleanup` queue, `RemoveHost` as one transaction plus background sync, context-aware locking.
 - Cleanup worked first in every sync; reconciliation of Origin CA and AOP certs per served zone; zone release when its last host goes; AOP cert id saved right after upload.
 - Settings: pending cleanup with errors, unused Origin CA certs with **Revoke**; home warning after 24 h of failures.
 - A host whose sync failed (seen in phase 3: Cloudflare answered one certificate request with "CA signing failure", HTTP 400) is retried after 1, 5 and 15 minutes, then with each 6-hourly sync, instead of only at the next 6-hourly sync.
 - Done when, on `doot.run`: create → delete → recreate an app with the same domain 3 times leaves exactly one Origin CA cert for it and one AOP cert in the zone; a delete while the token is temporarily invalid is cleaned up after the token is fixed; killing goboat during an AOP upload leaves no extra cert after the next sync; the leftover certs from earlier tests in `doot.run` are cleaned (AOP automatically, Origin CA via **Revoke** or reconciliation).
+- Result (VPS 1, `v0.0.4-rc1`):
+  - The first sync deleted the 2 leftover AOP certificates (3 → 1); the 3 leftover Origin CA certificates (`guestbook`, `cp` and the old project's name) were listed as unused and revoked with **Revoke** (7 → 4). All sites kept working.
+  - Delete + recreate of an app with the same domain, 3 times: after each delete 0 certificates and 0 DNS records for it, after each recreate exactly 1 certificate (A + AAAA records), 1 AOP certificate, nothing left in the queue.
+  - Delete while the Cloudflare API was unreachable from the server: the item showed in Cleanup pending with the error; after the API was reachable again the retry deleted both records and revoked the certificate.
+  - Interrupting an AOP upload is covered by unit tests (the id is saved right after the upload; extra certificates are deleted by the comparison) and by the real leftovers above, which came from exactly that.
+  - Releasing a zone is covered by unit tests only: the test zone also holds the dashboard domain.
+- Kept from the plan: DNS records are found by name and this server's addresses instead of saved record ids; this also leaves records alone that a server move repointed.
 
 ## Phase 5: backups every 10 minutes (quirk E)
 

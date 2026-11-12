@@ -41,6 +41,28 @@
     {{end}}</tbody>
   </table>
   {{end}}
+  {{if .Cleanup}}
+  <h3 id="cleanup">Cleanup pending</h3>
+  <p class="muted">Objects goboat created at Cloudflare and no longer uses. They are deleted on every sync until Cloudflare confirms it.</p>
+  <table class="stack">
+    <thead><tr><th>What</th><th>Why</th><th>Since</th><th>Attempts</th><th>Last error</th></tr></thead>
+    <tbody>{{range .Cleanup}}
+    <tr><td data-label="What">{{.What}}</td><td data-label="Why">{{.Reason}}</td><td data-label="Since">{{ago .CreatedAt}}</td>
+      <td data-label="Attempts">{{.Attempts}}</td><td class="clip" data-label="Last error">{{if .LastError}}<span class="error-text">{{.LastError}}</span>{{else}}<span class="muted">not tried yet</span>{{end}}</td></tr>
+    {{end}}</tbody>
+  </table>
+  {{end}}
+  {{if .Unused}}
+  <h3 id="unused">Unused certificates</h3>
+  <p class="muted">Origin CA certificates in your zones for hostnames goboat doesn't serve: left over from earlier setups, or used by another server. goboat never revokes these by itself.</p>
+  <table class="stack">
+    <thead><tr><th>Hostnames</th><th>Zone</th><th>Expires</th><th></th></tr></thead>
+    <tbody>{{range .Unused}}
+    <tr><td data-label="Hostnames">{{range $i, $h := .Hostnames}}{{if $i}}, {{end}}<code>{{$h}}</code>{{end}}</td><td data-label="Zone">{{.Zone}}</td><td data-label="Expires">{{.ExpiresOn}}</td>
+      <td class="end"><form method="post" action="/settings/revoke-cert" class="inline" data-confirm="Revoke this certificate? A server still using it stops working behind Cloudflare.">{{template "csrf" $csrf}}<input type="hidden" name="id" value="{{.ID}}"><button>Revoke</button></form></td></tr>
+    {{end}}</tbody>
+  </table>
+  {{end}}
   {{end}}
 </section>
 
