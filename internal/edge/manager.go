@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/im-anuvaad/goboat/internal/cloudflare"
@@ -101,7 +102,9 @@ type Manager struct {
 	unused    []UnusedCert
 	paused    string // why Cloudflare syncs are off ("" = they run)
 	srv       *http.Server
-	noKeep    bool      // retired: no keep-alive connections
+	noKeep    atomic.Bool // retired: no keep-alive connections
+	connMu    sync.Mutex
+	conns     map[net.Conn]http.ConnState
 	fwdAddrs  []string  // retired: pass connections on to these servers
 	fwdUntil  time.Time // ... until then
 	fwdPort   string    // "" = 443 (tests use another)
@@ -468,10 +471,11 @@ func (m *Manager) Serve(ctx context.Context) error {
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    64 << 10,
 		ErrorLog:          stdlog.New(&serverErrors{log: m.log}, "", 0),
+		ConnState:         m.connState,
 	}
 	m.mu.Lock()
 	m.srv = srv
-	if m.noKeep {
+	if m.noKeep.Load() {
 		srv.SetKeepAlivesEnabled(false)
 	}
 	m.mu.Unlock()
@@ -716,11 +720,38 @@ func forward(c net.Conn, addrs []string, port string, log *slog.Logger) {
 // for minutes; a server that was moved must not keep answering on them
 // once DNS points elsewhere (docs/architecture.md §10).
 func (m *Manager) DropConnections() {
+	m.noKeep.Store(true)
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.noKeep = true
 	if m.srv != nil {
 		m.srv.SetKeepAlivesEnabled(false)
+	}
+	m.mu.Unlock()
+	m.connMu.Lock()
+	defer m.connMu.Unlock()
+	for c, st := range m.conns {
+		if st == http.StateIdle || st == http.StateNew {
+			c.Close()
+		}
+	}
+}
+
+// connState tracks connections; once retired, every connection is closed
+// as soon as it is idle (HTTP/2 included, which keeps one connection busy
+// for many requests).
+func (m *Manager) connState(c net.Conn, st http.ConnState) {
+	m.connMu.Lock()
+	defer m.connMu.Unlock()
+	if m.conns == nil {
+		m.conns = map[net.Conn]http.ConnState{}
+	}
+	switch st {
+	case http.StateClosed, http.StateHijacked:
+		delete(m.conns, c)
+		return
+	}
+	m.conns[c] = st
+	if st == http.StateIdle && m.noKeep.Load() {
+		c.Close()
 	}
 }
 
