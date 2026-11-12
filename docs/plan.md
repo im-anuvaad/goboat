@@ -7,7 +7,7 @@ How the code gets from the imported codebase to what [architecture.md](architect
 | | Use |
 |---|---|
 | VPS 1 (2 vCPU, 1.9 GB, Ubuntu 24.04) | main goboat install |
-| VPS 2 (same) | MinIO as the S3-compatible bucket; the target of the server move in phase 6 |
+| VPS 2 (same) | Garage (S3-compatible) on port 80 as the bucket; the target of the server move in phase 6 |
 | Zone `doot.run` | the only Cloudflare zone used; every action is allowed there |
 | Test repos `im-anuvaad/goboat-test-*` | `hello` (minimal app from the contract), `heavy` (many dependencies, to test build memory and swap), `broken` (fails to build / fails its health check) |
 
@@ -61,11 +61,14 @@ Behaviour stays as it is (release-based deploys still work), so the rename can b
   - Releasing a zone is covered by unit tests only: the test zone also holds the dashboard domain.
 - Kept from the plan: DNS records are found by name and this server's addresses instead of saved record ids; this also leaves records alone that a server move repointed.
 
-## Phase 5: backups every 10 minutes (quirk E)
+## Phase 5: backups every 10 minutes (quirk E) (done)
 
 - Interval 10 min, fingerprint per database stored with the backup, skip when unchanged.
 - Hourly retention, local copy thinning, overrun detection and warning, app page shows 20 + **Show all**.
-- Done when, against MinIO: an idle app makes no new backups after its first; a write makes one at the next slot; objects older than 48 h are deleted except the newest; an outage of the bucket loses nothing and catches up.
+- Done when, against the test bucket: an idle app makes no new backups after its first; a write makes one at the next slot; objects older than 48 h are deleted except the newest; an outage of the bucket loses nothing and catches up.
+- Result (VPS 1, `v0.0.5-rc2`): all four checked, against **Garage** v2.5.0 on VPS 2 instead of MinIO (MinIO stopped publishing community binaries in October 2025). Details in architecture §8.
+- Not seen live: a skipped slot (a run longer than 10 minutes needs very large databases); the counting and the warning are in the code but not exercised on the VPS.
+- Also fixed: a data race in the phase 4 edge test helper that failed the release workflow once.
 
 ## Phase 6: server move
 
