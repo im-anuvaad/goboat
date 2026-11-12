@@ -48,6 +48,7 @@ func newFakeOld(t *testing.T) *fakeOld {
 			Apps: func() []AppInfo {
 				return []AppInfo{{Name: "web", Commit: strings.Repeat("a", 40), Branch: "main", Running: true}}
 			},
+			Addrs:  func() []string { return []string{"192.0.2.1", "2001:db8::1"} },
 			Bundle: func(ctx context.Context, w io.Writer) error { _, err := w.Write([]byte("settings")); return err },
 			Files: func(ctx context.Context, app string, have []FileInfo, w io.Writer) error {
 				_, _, err := PackDataDir(ctx, f.dataDir, f.staging, have, w)
@@ -80,6 +81,7 @@ func newFakeOld(t *testing.T) *fakeOld {
 
 type fakeNew struct {
 	mu       sync.Mutex
+	accepted []string
 	dataDir  string
 	prepared []string
 	started  []string
@@ -100,6 +102,12 @@ func (n *fakeNew) hooks() TargetHooks {
 			n.mu.Unlock()
 			return nil
 		},
+		Accept: func(addrs []string) {
+			n.mu.Lock()
+			n.accepted = addrs
+			n.mu.Unlock()
+		},
+		Addrs: func() []string { return []string{"198.51.100.2"} },
 	}
 }
 
@@ -166,6 +174,9 @@ func TestMoveEndToEnd(t *testing.T) {
 	}
 	if st := old.src.State(); st.Phase != PhaseDone || old.moved == nil || old.moved.IP != "198.51.100.2" {
 		t.Fatalf("old server after the move: %+v moved=%+v", st.Phase, old.moved)
+	}
+	if strings.Join(old.moved.Forward, ",") != "198.51.100.2" || strings.Join(nw.accepted, ",") != "192.0.2.1,2001:db8::1" {
+		t.Fatalf("addresses: old forwards to %v, new accepts %v", old.moved.Forward, nw.accepted)
 	}
 	if strings.Join(nw.prepared, ",") != "web@aaaaaaa/main" || strings.Join(nw.started, ",") != "web" {
 		t.Fatalf("new server: prepared %v, started %v", nw.prepared, nw.started)

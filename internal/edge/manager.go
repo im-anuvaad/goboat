@@ -101,7 +101,10 @@ type Manager struct {
 	unused    []UnusedCert
 	paused    string // why Cloudflare syncs are off ("" = they run)
 	srv       *http.Server
-	noKeep    bool // retired: no keep-alive connections
+	noKeep    bool      // retired: no keep-alive connections
+	fwdAddrs  []string  // retired: pass connections on to these servers
+	fwdUntil  time.Time // ... until then
+	fwdPort   string    // "" = 443 (tests use another)
 	retry     int
 	retryT    *time.Timer
 }
@@ -453,7 +456,7 @@ func (m *Manager) Serve(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("edge: listen %s: %w", m.cfg.Listen, err)
 	}
-	fl := m.Filter.Listen(ln, m.log, m.SetupOpen)
+	fl := m.forwarding(m.Filter.Listen(ln, m.log, m.SetupOpen))
 	m.Router.SetupOpen = m.SetupOpen
 	m.Router.DashboardReached = m.DashboardReached
 	m.Router.SetDashboardHost(m.DashboardHost())
@@ -619,6 +622,93 @@ func (m *Manager) PauseAndWait(why string) {
 	m.syncMu.Lock()
 	//lint:ignore SA2001 waiting for a running sync is the point; Sync checks the pause again under syncMu
 	m.syncMu.Unlock()
+}
+
+// ForwardTo makes a retired server pass every new connection from
+// Cloudflare, as raw TCP, to the server that replaced it (addrs, tried in
+// order) until the time is up. Cloudflare's edge picks a DNS change up
+// over a minute or two; meanwhile its connections to this server end up
+// there instead of at a "moved" page. TLS stays between Cloudflare and the
+// new server.
+func (m *Manager) ForwardTo(addrs []string, until time.Time) {
+	m.mu.Lock()
+	m.fwdAddrs, m.fwdUntil = addrs, until
+	m.mu.Unlock()
+	if len(addrs) > 0 && time.Now().Before(until) {
+		m.log.Info("passing connections on to the new server", "to", addrs, "until", until.UTC().Format(time.TimeOnly))
+	}
+}
+
+// PublicAddrs returns this server's public addresses (detecting them if
+// no sync did yet).
+func (m *Manager) PublicAddrs(ctx context.Context) []string {
+	v4, v6, err := m.publicIPs(ctx)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, a := range []string{v4, v6} {
+		if a != "" {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+type forwardListener struct {
+	net.Listener
+	m *Manager
+}
+
+func (m *Manager) forwarding(ln net.Listener) net.Listener {
+	return &forwardListener{Listener: ln, m: m}
+}
+
+func (l *forwardListener) Accept() (net.Conn, error) {
+	for {
+		c, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		l.m.mu.RLock()
+		addrs, until, port := l.m.fwdAddrs, l.m.fwdUntil, l.m.fwdPort
+		l.m.mu.RUnlock()
+		if _, setup := c.(*setupConn); setup || len(addrs) == 0 || time.Now().After(until) {
+			return c, nil
+		}
+		if port == "" {
+			port = "443"
+		}
+		go forward(c, addrs, port, l.m.log)
+	}
+}
+
+func forward(c net.Conn, addrs []string, port string, log *slog.Logger) {
+	defer c.Close()
+	var up net.Conn
+	var err error
+	for _, a := range addrs {
+		if up, err = net.DialTimeout("tcp", net.JoinHostPort(a, port), 5*time.Second); err == nil {
+			break
+		}
+	}
+	if up == nil {
+		log.Warn("passing a connection on to the new server failed", "err", err)
+		return
+	}
+	defer up.Close()
+	done := make(chan struct{}, 2)
+	cp := func(dst, src net.Conn) {
+		io.Copy(dst, src)
+		if tc, ok := dst.(*net.TCPConn); ok {
+			tc.CloseWrite()
+		}
+		done <- struct{}{}
+	}
+	go cp(up, c)
+	go cp(c, up)
+	<-done
+	<-done
 }
 
 // DropConnections closes idle keep-alive connections and keeps every later

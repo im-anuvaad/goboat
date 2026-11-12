@@ -29,6 +29,7 @@ var builtinRanges = []string{
 // IPFilter holds the allowed source ranges.
 type IPFilter struct {
 	prefixes atomic.Pointer[[]netip.Prefix]
+	extra    atomic.Pointer[extraAllow]
 	rejected atomic.Int64
 	source   atomic.Value // string: "built-in", "saved", "cloudflare"
 }
@@ -77,8 +78,30 @@ func (f *IPFilter) Ranges() ([]string, string) {
 }
 
 // Allowed reports whether addr may connect.
+// extraAllow is a temporary exception (a server that was replaced passes
+// Cloudflare's connections on to this one; docs/architecture.md §10).
+type extraAllow struct {
+	addrs map[netip.Addr]bool
+	until time.Time
+}
+
+// AllowTemporarily also accepts connections from addrs until the time is
+// up. TLS still requires the AOP client certificate where it is enforced.
+func (f *IPFilter) AllowTemporarily(addrs []string, d time.Duration) {
+	e := &extraAllow{addrs: map[netip.Addr]bool{}, until: time.Now().Add(d)}
+	for _, s := range addrs {
+		if a, err := netip.ParseAddr(s); err == nil {
+			e.addrs[a.Unmap()] = true
+		}
+	}
+	f.extra.Store(e)
+}
+
 func (f *IPFilter) Allowed(addr netip.Addr) bool {
 	addr = addr.Unmap()
+	if e := f.extra.Load(); e != nil && e.addrs[addr] && time.Now().Before(e.until) {
+		return true
+	}
 	for _, p := range *f.prefixes.Load() {
 		if p.Contains(addr) {
 			return true

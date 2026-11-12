@@ -171,10 +171,11 @@ func (c *Client) WaitSwitch(ctx context.Context) (SwitchAnswer, error) {
 	}
 }
 
-// Done tells the old server to retire.
-func (c *Client) Done(ctx context.Context) error {
+// Done tells the old server to retire; addrs are this server's public
+// addresses, where it passes Cloudflare's connections for a while.
+func (c *Client) Done(ctx context.Context, addrs []string) error {
 	var ok map[string]bool
-	return c.call(ctx, http.MethodPost, "/move/v1/done", nil, &ok)
+	return c.call(ctx, http.MethodPost, "/move/v1/done", DoneReport{Addrs: addrs}, &ok)
 }
 
 // Failed tells the old server the move failed (it restarts its apps).
@@ -191,6 +192,11 @@ type TargetHooks struct {
 	DataDir func(app string) (dir string, uid, gid int, err error)
 	// Start starts an app and waits until it is healthy.
 	Start func(ctx context.Context, app string) error
+	// Accept lets connections from the old server's addresses in (it
+	// passes Cloudflare's connections on after the switch).
+	Accept func(addrs []string)
+	// Addrs are this server's public addresses.
+	Addrs func() []string
 }
 
 // ErrCancelled means the move was cancelled on the old server.
@@ -209,6 +215,9 @@ func Run(ctx context.Context, c *Client, version string, h TargetHooks, log *slo
 	}
 	if hello.Version != version {
 		return fmt.Errorf("the old server runs %s and this one %s; update the old server first (run the install command there), then start the move again", hello.Version, version)
+	}
+	if h.Accept != nil && len(hello.Addrs) > 0 {
+		h.Accept(hello.Addrs)
 	}
 	report := func(app, text string) {
 		log.Info("move", "app", app, "step", text)
@@ -274,7 +283,11 @@ func Run(ctx context.Context, c *Client, version string, h TargetHooks, log *slo
 	}
 
 	// 8. The old server retires; then the caller points DNS here.
-	if err := c.Done(ctx); err != nil {
+	var addrs []string
+	if h.Addrs != nil {
+		addrs = h.Addrs()
+	}
+	if err := c.Done(ctx, addrs); err != nil {
 		return err
 	}
 	log.Info("move: the old server retired", "switch_took", time.Since(start).Round(100*time.Millisecond))

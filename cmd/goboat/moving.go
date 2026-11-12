@@ -48,6 +48,7 @@ func newMoveSource(lay layout.Layout, st *store.Store, box *secrets.Box, log *sl
 				}
 				return out
 			},
+			Addrs: func() []string { return e.PublicAddrs(context.Background()) },
 			Bundle: func(ctx context.Context, w io.Writer) error {
 				return move.MakeBundle(ctx, lay, layout.MasterKey, st.Writer(), w)
 			},
@@ -84,6 +85,7 @@ func newMoveSource(lay layout.Layout, st *store.Store, box *secrets.Box, log *sl
 			},
 			Moved: func(m move.Moved) {
 				ms.moved.Store(true)
+				e.ForwardTo(m.Forward, m.At.Add(move.ForwardFor))
 				e.DropConnections()
 				e.PauseAndWait(fmt.Sprintf("this server was moved to %s on %s", m.IP, m.At.UTC().Format(time.DateOnly)))
 				log.Info("this server was moved; it no longer serves apps, backs up or changes anything at Cloudflare", "new_server", m.IP)
@@ -114,7 +116,9 @@ func runIncoming(ctx context.Context, in move.Incoming, lay layout.Layout, st *s
 				u, err := users.Lookup(app)
 				return lay.DataDir(app), int(u.UID), int(u.GID), err
 			},
-			Start: func(ctx context.Context, app string) error { return dep.Start(ctx, app) },
+			Start:  func(ctx context.Context, app string) error { return dep.Start(ctx, app) },
+			Accept: func(addrs []string) { e.Filter.AllowTemporarily(addrs, 2*time.Hour+move.ForwardFor) },
+			Addrs:  func() []string { return e.PublicAddrs(ctx) },
 		}, log)
 	}
 	if err == nil {

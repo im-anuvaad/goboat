@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -403,4 +404,44 @@ func TestCleanupSparesConfiguredAndMovedHosts(t *testing.T) {
 	te.remove(t, "blog.example.test")
 	te.sync(t)
 	want(t, te.f, "A blog.example.test;A shop.example.test", "shop.example.test", 1)
+}
+
+// A retired server passes connections on, as raw TCP, to the new one.
+func TestForwardListener(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	up, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer up.Close()
+	go func() {
+		c, err := up.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		b := make([]byte, 5)
+		io.ReadFull(c, b)
+		c.Write(append([]byte("new:"), b...))
+	}()
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	_, port, _ := net.SplitHostPort(up.Addr().String())
+	m := &Manager{log: log, fwdPort: port}
+	fl := m.forwarding(ln)
+	defer fl.Close()
+	m.ForwardTo([]string{"127.0.0.1"}, time.Now().Add(time.Minute))
+	go func() {
+		c, err := fl.Accept() // only returns connections that are not forwarded
+		if err == nil {
+			c.Close()
+		}
+	}()
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.Write([]byte("hello"))
+	c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	b, _ := io.ReadAll(c)
+	if string(b) != "new:hello" {
+		t.Fatalf("got %q", b)
+	}
 }

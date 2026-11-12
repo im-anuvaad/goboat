@@ -48,7 +48,14 @@ type Hello struct {
 	Dashboard string    `json:"dashboard"`
 	Phase     Phase     `json:"phase"`
 	Apps      []AppInfo `json:"apps"`
+	// Addrs are the old server's public addresses: after the switch it
+	// passes Cloudflare's connections on to the new server, which must
+	// accept them from there.
+	Addrs []string `json:"addrs"`
 }
+
+// ForwardFor is how long a retired server passes connections on.
+const ForwardFor = 30 * time.Minute
 
 // Step is one line of progress shown on the old dashboard.
 type Step struct {
@@ -93,13 +100,20 @@ func (s State) Frozen() bool {
 
 // Moved is where a retired server's installation went.
 type Moved struct {
-	IP string    `json:"ip"`
-	At time.Time `json:"at"`
+	IP      string    `json:"ip"`
+	At      time.Time `json:"at"`
+	Forward []string  `json:"forward"` // the new server's addresses
+}
+
+// DoneReport is the new server's last message.
+type DoneReport struct {
+	Addrs []string `json:"addrs"` // its public addresses
 }
 
 // SourceHooks connect the old server's side to the rest of goboat.
 type SourceHooks struct {
 	Apps    func() []AppInfo
+	Addrs   func() []string // this server's public addresses
 	Bundle  func(ctx context.Context, w io.Writer) error
 	Files   func(ctx context.Context, app string, have []FileInfo, w io.Writer) error
 	Stop    func(ctx context.Context) (running []string, err error) // router "moving", backups paused, apps stopped
@@ -360,6 +374,9 @@ func (s *Source) hello(w http.ResponseWriter, r *http.Request) {
 	h := Hello{Version: s.Version, Dashboard: s.Dashboard(), Phase: s.st.Phase}
 	s.mu.Unlock()
 	h.Apps = s.Hooks.Apps()
+	if s.Hooks.Addrs != nil {
+		h.Addrs = s.Hooks.Addrs()
+	}
 	s.reply(w, r.URL.Path, h)
 }
 
@@ -472,6 +489,8 @@ func (s *Source) waitSwitch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Source) done(w http.ResponseWriter, r *http.Request) {
+	var rep DoneReport
+	s.read(r, &rep)
 	s.mu.Lock()
 	if s.st.Phase != PhaseSwitching || !s.st.Stopped {
 		s.mu.Unlock()
@@ -482,7 +501,7 @@ func (s *Source) done(w http.ResponseWriter, r *http.Request) {
 	s.st.DoneAt = time.Now()
 	s.stepLocked("", fmt.Sprintf("done: the new server serves everything; downtime here %s", time.Since(s.st.SwitchedAt).Round(time.Second)), false)
 	s.saveLocked(r.Context())
-	m := Moved{IP: s.st.NewIP, At: s.st.DoneAt}
+	m := Moved{IP: s.st.NewIP, At: s.st.DoneAt, Forward: rep.Addrs}
 	s.mu.Unlock()
 	b, _ := json.Marshal(m)
 	if err := s.Store.SetSetting(context.WithoutCancel(r.Context()), SettingMovedTo, b); err != nil {
