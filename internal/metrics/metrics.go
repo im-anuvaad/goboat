@@ -66,16 +66,21 @@ type Collector struct {
 	Requests func() map[string]edge.StatsSnapshot // nil without the edge
 	DataRoot string
 	Log      *slog.Logger
+	// Building reports whether a build is running (or just ended); swap
+	// use is expected then. nil = never.
+	Building func() bool
 
-	mu    sync.RWMutex
-	rings map[string][]Point // newest last, at most ringSize
-	prev  map[string]counters
-	host  cpuTimes
-	self  int64 // goboat CPU ticks
-	last  time.Time
-	cur   map[string][]rawSample // samples of the current minute
-	curM  time.Time
-	done  chan struct{}
+	mu      sync.RWMutex
+	swapOut int64              // pswpout at the last sample
+	swapped []swapEvent        // pages swapped out while no build ran, last hour
+	rings   map[string][]Point // newest last, at most ringSize
+	prev    map[string]counters
+	host    cpuTimes
+	self    int64 // goboat CPU ticks
+	last    time.Time
+	cur     map[string][]rawSample // samples of the current minute
+	curM    time.Time
+	done    chan struct{}
 }
 
 type counters struct {
@@ -94,6 +99,56 @@ type rawSample struct {
 }
 
 type cpuTimes struct{ total, idle uint64 }
+
+type swapEvent struct {
+	at    time.Time
+	pages int64
+}
+
+// readSwapOut is the number of pages written to swap since boot.
+func readSwapOut() int64 {
+	b, err := os.ReadFile("/proc/vmstat")
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if v, ok := strings.CutPrefix(line, "pswpout "); ok {
+			n, _ := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+			return n
+		}
+	}
+	return 0
+}
+
+// noteSwap records pages swapped out since the last sample, unless a build
+// is running.
+func (c *Collector) noteSwap(now time.Time) {
+	cur := readSwapOut()
+	building := c.Building != nil && c.Building()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if d := cur - c.swapOut; c.swapOut > 0 && d > 0 && !building {
+		c.swapped = append(c.swapped, swapEvent{at: now, pages: d})
+	}
+	c.swapOut = cur
+	for len(c.swapped) > 0 && now.Sub(c.swapped[0].at) > time.Hour {
+		c.swapped = c.swapped[1:]
+	}
+}
+
+// SwappedOutsideBuilds is how many bytes were written to swap in the last
+// hour while no build ran: a sign the server is short of memory.
+func (c *Collector) SwappedOutsideBuilds() int64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var n int64
+	for _, e := range c.swapped {
+		if time.Since(e.at) <= time.Hour {
+			n += e.pages
+		}
+	}
+	return n * int64(os.Getpagesize())
+}
 
 // Run samples every 10 s, writes rollups every minute and prunes hourly.
 func (c *Collector) Run(ctx context.Context) {
@@ -138,6 +193,7 @@ func (c *Collector) sample(now time.Time) {
 		reqs = c.Requests()
 	}
 
+	c.noteSwap(now)
 	samples := map[string]rawSample{}
 	// Host.
 	hi := hostinfo.Read(c.DataRoot)

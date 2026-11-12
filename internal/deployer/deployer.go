@@ -488,6 +488,9 @@ func (d *Deployer) deploy(ctx context.Context, cfg AppConfig, j job, lg *logs.Lo
 
 	// 3. Build and check the binary.
 	res, err := d.Builder.Build(ctx, name, j.id, ws, m.Package, lg)
+	if res.Took > 0 {
+		d.setBuildStats(j.id, res)
+	}
 	if err != nil {
 		return err
 	}

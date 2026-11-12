@@ -35,7 +35,7 @@ Behaviour stays as it is (release-based deploys still work), so the rename can b
 - Result: all of the above checked on VPS 1 with `v0.0.2-rc1` (figures in architecture §7.3). Also checked: an update by re-running the installer migrates the database and installs Go and swap; restarting goboat during a build marks it failed and leaves no build processes, cgroups or workspaces; an app cannot read another app's builds, and the build user cannot read any app's.
 - Moved to phase 3: the build's CPU/memory/swap as a chart (the deploy log has its peaks), and the "swap in use outside builds" warning.
 
-## Phase 3: app form and limits (quirks A, B, C)
+## Phase 3: app form and limits (quirks A, B, C) (done)
 
 - Domain required on Add app ("Enter the domain the app will be served on"), cannot be cleared in Settings; DB column `NOT NULL` with a unique index.
 - Memory and CPU drop-downs on Add app and Settings (architecture §6.1); total memory against RAM shown, warning above 75 %.
@@ -43,12 +43,15 @@ Behaviour stays as it is (release-based deploys still work), so the rename can b
 - Monitoring: a "swap in use outside builds" warning, and the last build's CPU, memory and swap on the deployment page.
 - Contract docs and form texts say limits come only from the dashboard.
 - Done when: creating an app without a domain is refused with that message; limits picked in the form are the values in the app's cgroup files after a restart.
+- Result (VPS 1, `v0.0.3-rc1`): an app without a domain and limits outside the choices are refused with those messages; removing a domain in Settings is refused; 512 MB / 0.5 cores saved on a running app left the cgroup at 256 MB / 1 core until **Restart to apply**, then `memory.max` = 536870912, `cpu.max` = `50000 100000`, `GOMEMLIMIT` = 90 % of it; the 75 % note appeared at 94 %; the deployment page shows build time, CPU time and peaks; a 1.9 GB memory hog outside goboat raised the swap warning.
+- The database keeps a partial unique index on the domain (empty values allowed) so apps created before this phase still load; the rule is enforced by the forms.
 
 ## Phase 4: Cloudflare cleanup (quirk D)
 
 - `edge_hosts` with DNS record ids, `cf_cleanup` queue, `RemoveHost` as one transaction plus background sync, context-aware locking.
 - Cleanup worked first in every sync; reconciliation of Origin CA and AOP certs per served zone; zone release when its last host goes; AOP cert id saved right after upload.
 - Settings: pending cleanup with errors, unused Origin CA certs with **Revoke**; home warning after 24 h of failures.
+- A host whose sync failed (seen in phase 3: Cloudflare answered one certificate request with "CA signing failure", HTTP 400) is retried after 1, 5 and 15 minutes, then with each 6-hourly sync, instead of only at the next 6-hourly sync.
 - Done when, on `doot.run`: create → delete → recreate an app with the same domain 3 times leaves exactly one Origin CA cert for it and one AOP cert in the zone; a delete while the token is temporarily invalid is cleaned up after the token is fixed; killing goboat during an AOP upload leaves no extra cert after the next sync; the leftover certs from earlier tests in `doot.run` are cleaned (AOP automatically, Origin CA via **Revoke** or reconciliation).
 
 ## Phase 5: backups every 10 minutes (quirk E)

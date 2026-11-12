@@ -127,7 +127,7 @@ func serve(log *slog.Logger) error {
 	}
 
 	mc := &metrics.Collector{Store: st, Sup: sup, DataRoot: lay.Root, Log: log.With("component", "metrics"),
-		Requests: edgeMgr.Router.Stats}
+		Requests: edgeMgr.Router.Stats, Building: func() bool { return bld.Busy(time.Minute) }}
 
 	dash := &web.Server{
 		Auth: authSvc, Apps: appSvc, Dep: dep, Sup: sup, Edge: edgeMgr, Store: st,

@@ -220,7 +220,7 @@ func (s *Server) metricWarnings(ctx context.Context, rows []AppRow) []string {
 	if p, ok := s.Metrics.Latest(metrics.Host); ok {
 		if p.DiskTotal > 0 {
 			if pct := 100 * float64(p.DiskUsed) / float64(p.DiskTotal); pct > th.DiskPercent {
-				ws = append(ws, fmt.Sprintf("Disk is %.0f%% full (%s free). Releases, logs and backups need space.", pct, fmtBytes(float64(p.DiskTotal-p.DiskUsed))))
+				ws = append(ws, fmt.Sprintf("Disk is %.0f%% full (%s free). Builds, caches, logs and backups need space.", pct, fmtBytes(float64(p.DiskTotal-p.DiskUsed))))
 			}
 		}
 		if p.MemLimit > 0 {
@@ -228,6 +228,9 @@ func (s *Server) metricWarnings(ctx context.Context, rows []AppRow) []string {
 				ws = append(ws, fmt.Sprintf("Memory is %.0f%% used (%s of %s). Apps may be killed for running out of memory.", pct, fmtBytes(float64(p.Mem)), fmtBytes(float64(p.MemLimit))))
 			}
 		}
+	}
+	if n := s.Metrics.SwappedOutsideBuilds(); n >= 64<<20 {
+		ws = append(ws, fmt.Sprintf("In the last hour the server wrote %s to swap while no build was running: the apps, goboat and the system together need more memory than the server has, which slows everything down. Lower an app's memory limit, stop an app you don't need, or use a server with more memory.", fmtBytes(float64(n))))
 	}
 	for _, r := range rows {
 		if n := s.Metrics.OOMSince(r.Name, time.Hour); n > 0 {

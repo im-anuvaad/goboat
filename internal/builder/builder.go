@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -43,6 +44,18 @@ type Builder struct {
 	Cgroups *cgroup.Manager
 	GoRoot  string // default layout.GoRoot
 	Log     *slog.Logger
+
+	mu      sync.Mutex
+	running int
+	lastEnd time.Time
+}
+
+// Busy reports whether a build is running or ended within the last d
+// (swap use then is expected; docs/architecture.md §9).
+func (b *Builder) Busy(d time.Duration) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.running > 0 || (!b.lastEnd.IsZero() && time.Since(b.lastEnd) < d)
 }
 
 func (b *Builder) goRoot() string {
@@ -134,6 +147,7 @@ func (b *Builder) Remove(ws Workspace) {
 type Result struct {
 	GoVersion  string // of the toolchain that built it, e.g. go1.27.4
 	Took       time.Duration
+	CPUTime    time.Duration // of all build processes together
 	PeakMemory int64
 	PeakSwap   int64
 }
@@ -142,6 +156,15 @@ type Result struct {
 // output goes to lg.
 func (b *Builder) Build(ctx context.Context, appName string, id int64, ws Workspace, pkg string, lg *logs.Log) (Result, error) {
 	var res Result
+	b.mu.Lock()
+	b.running++
+	b.mu.Unlock()
+	defer func() {
+		b.mu.Lock()
+		b.running--
+		b.lastEnd = time.Now()
+		b.mu.Unlock()
+	}()
 	goBin := filepath.Join(b.goRoot(), "bin", "go")
 	if _, err := os.Stat(goBin); err != nil {
 		return res, fmt.Errorf("the Go toolchain is missing at %s; re-run the install command", b.goRoot())
@@ -225,7 +248,9 @@ func (b *Builder) Build(ctx context.Context, appName string, id int64, ws Worksp
 	res.Took = time.Since(start)
 	res.PeakMemory, res.PeakSwap = g.Peaks()
 	st, _ := g.Stats()
-	lg.Writef("build took %s, peak memory %s, peak swap %s", res.Took.Round(100*time.Millisecond), mb(res.PeakMemory), mb(res.PeakSwap))
+	res.CPUTime = time.Duration(st.CPUUsageUsec) * time.Microsecond
+	lg.Writef("build took %s (CPU time %s), peak memory %s, peak swap %s", res.Took.Round(100*time.Millisecond),
+		res.CPUTime.Round(100*time.Millisecond), mb(res.PeakMemory), mb(res.PeakSwap))
 	switch {
 	case why != nil:
 		return res, why

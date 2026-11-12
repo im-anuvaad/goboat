@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/im-anuvaad/goboat/internal/app"
 	"github.com/im-anuvaad/goboat/internal/apps"
 	"github.com/im-anuvaad/goboat/internal/auth"
 	"github.com/im-anuvaad/goboat/internal/backup"
@@ -236,18 +237,20 @@ func formInput(r *http.Request) apps.Input {
 	f := func(k string) string { return r.PostFormValue(k) }
 	return apps.Input{
 		Repo: f("repo"), Branch: f("branch"), Domain: f("domain"),
-		Memory: f("memory"), CPU: f("cpu"), Pids: f("pids"),
+		Memory: f("memory"), CPU: f("cpu"),
 		RestoreFrom: f("restore_from"),
 	}
 }
 
 func (s *Server) newAppPage(w http.ResponseWriter, r *http.Request) {
-	in := apps.Input{Memory: "256M", CPU: "1", Pids: "256", RestoreFrom: apps.AutoFolder}
+	in := apps.Input{Memory: humanLimit(app.DefaultMemoryMax), CPU: cpuString(app.DefaultCPUMax), RestoreFrom: apps.AutoFolder}
 	s.render(w, r, http.StatusOK, "app_new", "Add app", "apps", s.newAppData(r.Context(), in, nil))
 }
 
 func (s *Server) newAppData(ctx context.Context, in apps.Input, err error) map[string]any {
 	d := map[string]any{"In": in}
+	d["MemChoices"], d["CPUChoices"] = limitChoices(in)
+	d["Budget"] = s.memoryBudget(ctx, "")
 	if err != nil {
 		var list []string
 		for _, e := range strings.Split(err.Error(), "\n") {
@@ -325,6 +328,9 @@ func (s *Server) createApp(w http.ResponseWriter, r *http.Request) {
 		msg += fmt.Sprintf(" Its data was restored from the newest backup in %s/ (%s).", a.RestoredFrom, strings.Join(a.Restored, ", "))
 	}
 	msg += " Add env vars if it needs any, then press Deploy: goboat builds the newest commit of " + a.Branch + "."
+	if note := s.memoryBudget(r.Context(), "").Warning(); note != "" {
+		msg += " " + note
+	}
 	if a.Domain != "" {
 		msg += " DNS and the certificate for " + a.Domain + " are being set up in the background."
 	}
@@ -379,8 +385,9 @@ func (s *Server) appPage(w http.ResponseWriter, r *http.Request) {
 		data["Edit"] = apps.Input{
 			Repo: full.Repo, Branch: full.Branch, Domain: full.Domain,
 			Memory: humanLimit(full.Limits.MemoryMax), CPU: strconv.FormatFloat(full.Limits.CPUMax, 'f', -1, 64),
-			Pids: strconv.Itoa(full.Limits.PidsMax),
 		}
+		data["MemChoices"], data["CPUChoices"] = limitChoices(data["Edit"].(apps.Input))
+		data["Budget"] = s.memoryBudget(r.Context(), name)
 	}
 	if row.Domain != "" {
 		for _, h := range s.Edge.Status(r.Context()).Hosts {
@@ -441,9 +448,126 @@ func (s *Server) appAction(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) updateApp(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("app")
-	_, err := s.Apps.Update(r.Context(), name, formInput(r))
-	msg := "Settings saved. A new branch applies on the next deploy, new limits on the next restart; the domain is re-routed now."
-	redirect(w, r, "/apps/"+name, err, msg)
+	old, err := s.Apps.Get(r.Context(), name)
+	if err != nil {
+		redirect(w, r, "/apps/"+name, err, "")
+		return
+	}
+	a, err := s.Apps.Update(r.Context(), name, formInput(r))
+	if err != nil {
+		redirect(w, r, "/apps/"+name+"#settings", err, "")
+		return
+	}
+	msg := "Settings saved."
+	if a.Branch != old.Branch || a.Repo != old.Repo {
+		msg += " The next deploy builds from " + a.Branch + "."
+	}
+	if a.Domain != old.Domain {
+		msg += " " + a.Domain + " is routed now; its DNS record and certificate are being set up."
+	}
+	if a.Limits != old.Limits {
+		if s.Dep.NeedsRestart(name) {
+			msg += fmt.Sprintf(" The new limits (%s, %s) apply when the app restarts: press Restart to apply.", memLabel(a.Limits.MemoryMax), cpuLabel(a.Limits.CPUMax))
+		} else {
+			msg += fmt.Sprintf(" The new limits (%s, %s) apply when the app starts.", memLabel(a.Limits.MemoryMax), cpuLabel(a.Limits.CPUMax))
+		}
+		if note := s.memoryBudget(r.Context(), "").Warning(); note != "" {
+			msg += " " + note
+		}
+	}
+	if msg == "Settings saved." {
+		msg = "Nothing changed."
+	}
+	redirect(w, r, "/apps/"+name, nil, msg)
+}
+
+// Choice is one option of a limit drop-down.
+type Choice struct {
+	Value, Label string
+	Selected     bool
+}
+
+// limitChoices are the memory and CPU options for a form showing in. A
+// current value from before the fixed choices is offered too, so saving
+// other settings doesn't force a change.
+func limitChoices(in apps.Input) (mem, cpu []Choice) {
+	found := false
+	for _, n := range app.MemoryChoices {
+		v := humanLimit(n)
+		mem = append(mem, Choice{Value: v, Label: memLabel(n), Selected: v == in.Memory})
+		found = found || v == in.Memory
+	}
+	if !found && in.Memory != "" {
+		mem = append(mem, Choice{Value: in.Memory, Label: in.Memory + " (current)", Selected: true})
+	}
+	found = false
+	for _, n := range app.CPUChoices {
+		v := cpuString(n)
+		cpu = append(cpu, Choice{Value: v, Label: cpuLabel(n), Selected: v == in.CPU})
+		found = found || v == in.CPU
+	}
+	if !found && in.CPU != "" {
+		cpu = append(cpu, Choice{Value: in.CPU, Label: in.CPU + " cores (current)", Selected: true})
+	}
+	return mem, cpu
+}
+
+func memLabel(n int64) string {
+	if n%(1<<30) == 0 {
+		return fmt.Sprintf("%d GB", n>>30)
+	}
+	return fmtBytes(float64(n))
+}
+
+func cpuString(n float64) string { return strconv.FormatFloat(n, 'f', -1, 64) }
+
+func cpuLabel(n float64) string {
+	if n == 1 {
+		return "1 core"
+	}
+	return cpuString(n) + " cores"
+}
+
+// Budget compares the apps' memory limits with the server's RAM.
+type Budget struct {
+	Others int64 // limits of the apps other than the one being edited
+	RAM    int64
+	Total  int64 // all apps
+}
+
+// budgetShare is the share of RAM the apps' limits may add up to before
+// goboat warns: the rest is for goboat, the system and builds (which also
+// have swap).
+const budgetShare = 0.75
+
+// Warning is a sentence when all apps together may use more than
+// budgetShare of the RAM ("" otherwise).
+func (b Budget) Warning() string {
+	if b.RAM == 0 || float64(b.Total) <= budgetShare*float64(b.RAM) {
+		return ""
+	}
+	return fmt.Sprintf("Note: the apps' memory limits now add up to %s, %.0f%% of the server's %s. If they all use that much, builds slow down (they swap) and apps can be killed for running out of memory.",
+		fmtBytes(float64(b.Total)), 100*float64(b.Total)/float64(b.RAM), fmtBytes(float64(b.RAM)))
+}
+
+// Percent of RAM all apps may use.
+func (b Budget) Percent() float64 {
+	if b.RAM == 0 {
+		return 0
+	}
+	return 100 * float64(b.Total) / float64(b.RAM)
+}
+
+func (s *Server) memoryBudget(ctx context.Context, editing string) Budget {
+	b := Budget{RAM: hostinfo.Read(s.Layout.Root).MemTotal}
+	list, _ := s.Apps.List(ctx)
+	for _, a := range list {
+		b.Total += a.Limits.MemoryMax
+		if a.Name != editing {
+			b.Others += a.Limits.MemoryMax
+		}
+	}
+	return b
 }
 
 func (s *Server) setEnv(w http.ResponseWriter, r *http.Request) {

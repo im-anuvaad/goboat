@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/im-anuvaad/goboat/internal/builder"
 )
 
 // Deployment statuses.
@@ -37,7 +39,15 @@ type Deployment struct {
 	CreatedAt  time.Time `json:"created_at"`
 	StartedAt  time.Time `json:"started_at"`
 	FinishedAt time.Time `json:"finished_at"`
+	// What its build used (zero when nothing was built).
+	BuildTime  time.Duration `json:"build_time"`
+	BuildCPU   time.Duration `json:"build_cpu"`
+	PeakMemory int64         `json:"peak_memory"`
+	PeakSwap   int64         `json:"peak_swap"`
 }
+
+// Built reports whether the deployment ran a build.
+func (d Deployment) Built() bool { return d.BuildTime > 0 }
 
 // Done reports whether the deployment has finished.
 func (d Deployment) Done() bool { return d.Status == StatusSucceeded || d.Status == StatusFailed }
@@ -79,13 +89,16 @@ func fromUnix(n int64) time.Time {
 	return time.Unix(n, 0).UTC()
 }
 
-const deploymentCols = `id, app, kind, status, build_id, git_sha, branch, error, created_at, started_at, finished_at`
+const deploymentCols = `id, app, kind, status, build_id, git_sha, branch, error, created_at, started_at, finished_at,
+	build_ms, build_cpu_ms, peak_memory, peak_swap`
 
 func scanDeployment(s interface{ Scan(...any) error }) (Deployment, error) {
 	var d Deployment
-	var c, st, f int64
-	err := s.Scan(&d.ID, &d.App, &d.Kind, &d.Status, &d.BuildID, &d.GitSHA, &d.Branch, &d.Error, &c, &st, &f)
+	var c, st, f, bms, cms int64
+	err := s.Scan(&d.ID, &d.App, &d.Kind, &d.Status, &d.BuildID, &d.GitSHA, &d.Branch, &d.Error, &c, &st, &f,
+		&bms, &cms, &d.PeakMemory, &d.PeakSwap)
 	d.CreatedAt, d.StartedAt, d.FinishedAt = fromUnix(c), fromUnix(st), fromUnix(f)
+	d.BuildTime, d.BuildCPU = time.Duration(bms)*time.Millisecond, time.Duration(cms)*time.Millisecond
 	return d, err
 }
 
@@ -109,6 +122,13 @@ func (d *Deployer) setStatus(id int64, status string) {
 		col = ", started_at = " + fmt.Sprint(time.Now().Unix())
 	}
 	if _, err := d.db.Writer().Exec(`UPDATE deployments SET status = ?`+col+` WHERE id = ?`, status, id); err != nil {
+		d.log.Error("update deployment", "id", id, "err", err)
+	}
+}
+
+func (d *Deployer) setBuildStats(id int64, r builder.Result) {
+	if _, err := d.db.Writer().Exec(`UPDATE deployments SET build_ms = ?, build_cpu_ms = ?, peak_memory = ?, peak_swap = ? WHERE id = ?`,
+		max(r.Took.Milliseconds(), 1), r.CPUTime.Milliseconds(), r.PeakMemory, r.PeakSwap, id); err != nil {
 		d.log.Error("update deployment", "id", id, "err", err)
 	}
 }

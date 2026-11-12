@@ -9,6 +9,7 @@
     <dt>App</dt><dd><a href="/apps/{{.App}}">{{.App}}</a></dd>
     <dt>Kind</dt><dd>{{.Kind}}</dd>
     <dt>Commit</dt><dd>{{if .GitSHA}}<code>{{short .GitSHA}}</code>{{if .Branch}} of <code>{{.Branch}}</code>{{end}}{{else}}<span class="muted">-</span>{{end}}</dd>
+    {{if .Built}}<dt>Build</dt><dd>{{.BuildTime.Round 100000000}} (CPU time {{.BuildCPU.Round 100000000}}) · peak memory {{bytes .PeakMemory}}{{if .PeakSwap}} · <span class="warn-text">peak swap {{bytes .PeakSwap}}</span>{{else}} · no swap{{end}}</dd>{{end}}
     <dt>Started</dt><dd>{{datetime .StartedAt}}{{if .FinishedAt.IsZero}}{{else}} · took {{dur .StartedAt .FinishedAt}}{{end}}</dd>
     {{if .Error}}<dt>Error</dt><dd class="error-text pre">{{.Error}}</dd>{{end}}
   </dl>
