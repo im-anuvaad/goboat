@@ -17,7 +17,7 @@ import (
 )
 
 // Everything in DATA_DIR survives redeploys, not only the SQLite files that
-// get backed up (docs/app-contract.md §7). This runs the on-disk steps of
+// get backed up (docs/app-contract.md §8). This runs the on-disk steps of
 // several deploys (directory repair, switching `current`, wiping TMPDIR,
 // pruning old builds) and checks that DATA_DIR is untouched.
 func TestDataDirSurvivesRedeploys(t *testing.T) {

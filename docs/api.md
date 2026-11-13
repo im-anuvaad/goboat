@@ -1,6 +1,6 @@
 # goboat Status API
 
-A small **read-only** JSON API for scripts and AI agents: "is my blog up?", "why is the shop unhealthy?", "when was the last backup?". It can't deploy, stop, restart or change anything; that stays in the dashboard.
+A small **read-only** JSON API on every goboat installation for scripts and AI agents: "is my blog up?", "why is the shop unhealthy?", "when was the last backup?". It can't deploy, stop, restart or change anything; that stays in the dashboard.
 
 Version: **v1**. Base URL: `https://<dashboard domain>/api/v1`.
 
@@ -26,7 +26,7 @@ There is one token at a time. **Rotate token** creates a new one and the old one
 | Request | Returns |
 |---|---|
 | `GET /api/v1/status` | The whole server: overall `ok`, host resources, dashboard warnings, a summary of every app |
-| `GET /api/v1/apps` | Every app (summary form) |
+| `GET /api/v1/apps` | `{"apps": [...]}`: every app in summary form |
 | `GET /api/v1/apps/{name}` | One app in detail: process, limits, current usage, last deployment, last backup, domain status, warnings |
 
 For an agent, `status` answers almost everything in one call; use `apps/{name}` to explain a problem.
@@ -138,14 +138,28 @@ Everything above, plus:
 ```
 
 - `now` is the newest 10-second sample, `null` until the first one; percentiles are `null` without traffic.
+- `last_deployment.kind` is `deploy`, `rollback` or `move` (built on a server that took over); `status` is `queued`, `building`, `deploying`, `succeeded` or `failed`. A failed build has the compiler error in `error`.
+- `last_backup.kind` is `scheduled`, `pre-deploy` or `manual`; `status` is `running`, `ok` or `failed`. Scheduled backups are skipped while the databases don't change, so `created_at` can be old on an idle app.
 - `last_deployment`, `last_backup` and `domain_status` are `null` when there is none.
 - `warnings` explains, in plain words, why the app is unhealthy or needs attention.
 
 ## Conventions
 
 - Times are UTC, RFC 3339; unknown times are `null`. Sizes are bytes; numbers are rounded to 2 decimals.
-- Errors are JSON with an `error` message: `401` (missing or wrong token), `403` (setup address), `404` (unknown app or endpoint), `405` (anything but `GET`/`HEAD`), `429` (rate limited; `Retry-After` in seconds), `500`.
+- Errors are JSON with an `error` message: `401` (missing or wrong token), `403` (setup address), `404` (unknown app or endpoint), `405` (anything but `GET`/`HEAD`), `410` (this server was moved: the message names the new one; ask again later, the dashboard domain reaches the new server once DNS follows), `429` (rate limited; `Retry-After` in seconds), `500`.
+- A server move (deployment.md §8) keeps the token: it moves with the account.
 - New fields may be added within v1; existing ones keep their name and meaning.
+
+## Recipes
+
+```bash
+api() { curl -fsS -H "Authorization: Bearer $GOBOAT_TOKEN" "https://goboat.example.com/api/v1$1"; }
+
+api /status | jq '{ok, summary, warnings}'                       # one-line health check
+api /apps | jq -r '.apps[] | select(.healthy | not) | .name'      # unhealthy apps
+api /apps/shop | jq '{state, error: .process.last_error, deploy: .last_deployment}'
+api /status | jq -e .ok >/dev/null || echo "something needs attention"   # for cron or monitoring
+```
 
 ## For AI agents
 

@@ -25,7 +25,7 @@ type Limits struct {
 	StripTop bool
 }
 
-// SourceLimits apply to an app's source archive (docs/app-contract.md §3).
+// SourceLimits apply to an app's source archive (docs/app-contract.md §4).
 var SourceLimits = Limits{MaxBytes: 500 << 20, MaxEntries: 50000, StripTop: true}
 
 // MaxArchive is the largest source archive goboat downloads.

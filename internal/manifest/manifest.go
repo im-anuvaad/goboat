@@ -1,5 +1,5 @@
 // Package manifest parses and validates an app's goboat.toml
-// (docs/app-contract.md §2).
+// (docs/app-contract.md §3).
 package manifest
 
 import (
@@ -55,7 +55,7 @@ func Load(dir string) (*Manifest, error) {
 	p := filepath.Join(dir, FileName)
 	st, err := os.Lstat(p)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("%s not found at the root of the repository at this commit; add one (docs/app-contract.md §2)", FileName)
+		return nil, fmt.Errorf("%s not found at the root of the repository at this commit; add one (docs/app-contract.md §3)", FileName)
 	}
 	if err != nil {
 		return nil, err
