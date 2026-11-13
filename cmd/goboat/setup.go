@@ -35,6 +35,24 @@ func runSetupHost(stdout, stderr io.Writer) int {
 }
 
 func setupHost(out io.Writer) error {
+	if err := prepareHost(out); err != nil {
+		return err
+	}
+	lay := layout.Default()
+
+	// The one-time password is written while goboat is stopped (it caches
+	// the state in memory).
+	ctx := context.Background()
+	st, err := store.Open(ctx, lay.DBPath())
+	if err != nil {
+		return err
+	}
+	return finishSetup(ctx, out, lay, st)
+}
+
+// prepareHost does what every install, update and move needs, with goboat
+// stopped: directories, master key, build user, Go, swap, systemd unit.
+func prepareHost(out io.Writer) error {
 	if os.Geteuid() != 0 {
 		return errors.New("must run as root")
 	}
@@ -80,14 +98,10 @@ func setupHost(out io.Writer) error {
 	if err := systemctl("enable", "--quiet", "goboat"); err != nil {
 		return err
 	}
+	return nil
+}
 
-	// The one-time password is written while goboat is stopped (it caches
-	// the state in memory).
-	ctx := context.Background()
-	st, err := store.Open(ctx, lay.DBPath())
-	if err != nil {
-		return err
-	}
+func finishSetup(ctx context.Context, out io.Writer, lay layout.Layout, st *store.Store) error {
 	pw, until, err := auth.NewSetupPassword(ctx, st)
 	var domain string
 	if v, ok, _ := st.GetSetting(ctx, edge.SettingDashboardDomain); ok {

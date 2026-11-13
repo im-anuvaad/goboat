@@ -1,0 +1,63 @@
+{{define "content"}}
+{{$csrf := .CSRF}}
+{{with .Data}}
+<div id="move" data-refresh="3">
+<section class="card">
+  <h1>Move to another server</h1>
+  <p class="muted">Moves this installation to a new server: the account, settings, apps, env vars, certificates and every file in the apps' data folders. The new server builds every app while this one keeps serving; then <b>Switch now</b> hands over, typically in under a minute. Logs, metrics and the local backup copies stay behind (the backups in the bucket are used by the new server).</p>
+
+  {{if or (eq .State.Phase "") (eq .State.Phase "done") (eq .State.Phase "failed") (eq .State.Phase "cancelled") (and (eq .State.Phase "waiting") (not .Active))}}
+  {{if eq .State.Phase "failed"}}<p class="error">The last move failed: {{.State.Error}}</p>{{end}}
+  {{if eq .State.Phase "cancelled"}}<p class="info">The last move was cancelled; everything stayed here.</p>{{end}}
+  {{if and (eq .State.Phase "waiting") (not .Active)}}<p class="info">The last move code expired without being used.</p>{{end}}
+  <h2>1. Prepare the new server</h2>
+  <p>A fresh Ubuntu 24.04+ VPS with at least 2 GB of RAM and ports 22 and 443 open (the same requirements as for installing goboat).</p>
+  <h2>2. Create a move code</h2>
+  {{if not .DashboardReady}}<p class="warn">The dashboard domain must work first: the new server connects to it.</p>{{else}}
+  <form method="post" action="/settings/move/start" class="grid">
+    {{template "csrf" $csrf}}
+    <label>Your password <input type="password" name="password" required autocomplete="current-password"><small>The move code gives whoever has it a copy of everything, so it needs your password.</small></label>
+    <div class="wide buttons"><button class="primary">Create move code</button></div>
+  </form>
+  {{end}}
+  {{end}}
+
+  {{if eq .State.Phase "waiting"}}{{if .Active}}
+  <h2>Run this on the new server</h2>
+  <p>Over SSH, as a user with sudo. The code works once, until {{datetime .State.Expires}}; don't share it.</p>
+  <pre class="log copy">{{.Command}}</pre>
+  <p class="muted">It installs goboat (the same version as here), copies the settings and starts building the apps. This page follows the progress.</p>
+  <form method="post" action="/settings/move/cancel" class="inline">{{template "csrf" $csrf}}<button>Cancel</button></form>
+  {{end}}{{end}}
+
+  {{if or (eq .State.Phase "connected") (eq .State.Phase "ready") (eq .State.Phase "switching")}}
+  <p class="info">The new server <b>{{.State.NewIP}}</b> is taking over. Settings and apps here can't be changed until the move ends.</p>
+  {{if eq .State.Phase "ready"}}
+  <p><b>Everything is built and copied.</b> When you switch, the apps here stop (visitors see a short "moving" page), the new server takes the files that changed since the copy, starts the apps and points the DNS records at itself.</p>
+  <div class="buttons">
+    <form method="post" action="/settings/move/switch" class="inline" data-confirm="Switch to the new server now? The apps are down for a short moment.">{{template "csrf" $csrf}}<button class="primary">Switch now</button></form>
+    <form method="post" action="/settings/move/cancel" class="inline" data-confirm="Cancel the move? Everything stays here.">{{template "csrf" $csrf}}<button>Cancel</button></form>
+  </div>
+  {{else if eq .State.Phase "switching"}}
+  <p class="warn">Switching for {{.SwitchFor}}: the apps here are stopped; the new server is starting them.</p>
+  <form method="post" action="/settings/move/cancel" class="inline" data-confirm="Cancel the switch? The apps start here again.">{{template "csrf" $csrf}}<button>Cancel and restart the apps here</button></form>
+  {{else}}
+  <p class="muted">The new server is building the apps and copying their data; this server keeps serving.</p>
+  <form method="post" action="/settings/move/cancel" class="inline" data-confirm="Cancel the move? Everything stays here.">{{template "csrf" $csrf}}<button>Cancel</button></form>
+  {{end}}
+  {{end}}
+
+  {{if eq .State.Phase "done"}}
+  <p class="info">Moved to <b>{{.State.NewIP}}</b> on {{datetime .State.DoneAt}}.</p>
+  {{end}}
+
+  {{with .State.Steps}}
+  <h2>Progress</h2>
+  <table class="stack"><tbody>{{range .}}
+    <tr><td class="nowrap" data-label="Time">{{datetime .At}}</td><td data-label="App">{{.App}}</td><td data-label="Step">{{if .Failed}}<span class="error-text">{{.Text}}</span>{{else}}{{.Text}}{{end}}</td></tr>
+  {{end}}</tbody></table>
+  {{end}}
+</section>
+</div>
+{{end}}
+{{end}}

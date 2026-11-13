@@ -435,6 +435,72 @@ func (d *Deployer) SetGitHubToken(ctx context.Context, token string) error {
 }
 
 func (d *Deployer) deploy(ctx context.Context, cfg AppConfig, j job, lg *logs.Log) error {
+	b, fresh, err := d.buildCommit(ctx, cfg, j, lg)
+	if err != nil {
+		return err
+	}
+	// 5-9. Switch with health check; go back on failure.
+	if err := d.activate(ctx, cfg, b, j.id, lg); err != nil {
+		if fresh {
+			d.removeBuild(cfg.Base.Name, b.ID, lg)
+		}
+		return err
+	}
+	d.pruneBuilds(cfg.Base.Name, lg)
+	return nil
+}
+
+// Prepare builds commit sha of an app (or reuses a kept build) and makes
+// it the app's current build without starting it: a server taking over
+// from another builds every app before the switch (docs/architecture.md
+// §10). It runs outside the queue; the deployment is recorded as kind
+// "move". The app must be stopped.
+func (d *Deployer) Prepare(ctx context.Context, appName, sha, branch string) (int64, error) {
+	cfg, ok := d.Config(appName)
+	if !ok {
+		return 0, fmt.Errorf("unknown app %q", appName)
+	}
+	id, err := d.insertDeployment(ctx, appName, KindMove, sha, branch)
+	if err != nil {
+		return 0, err
+	}
+	d.mu.Lock()
+	d.pending[appName] = id
+	d.mu.Unlock()
+	defer func() {
+		d.mu.Lock()
+		delete(d.pending, appName)
+		d.mu.Unlock()
+	}()
+	lg, err := logs.Open(d.Layout.DeployLog(appName, id), logs.Options{MaxSize: 64 << 20, Keep: 1, RingSize: 64})
+	if err != nil {
+		d.finish(id, err)
+		return id, err
+	}
+	defer lg.Close()
+	d.setStatus(id, StatusBuilding)
+	lg.Writef("move: building commit %s of %s (branch %s) on the new server", shortSHA(sha), cfg.Repo, branch)
+	b, _, err := d.buildCommit(ctx, cfg, job{id: id, app: appName, kind: KindMove, sha: sha, branch: branch}, lg)
+	if err == nil {
+		err = d.swapCurrent(appName, b.ID)
+	}
+	if err == nil {
+		if a := d.Supervisor.Get(appName); a != nil {
+			err = a.Update(ctx, d.specFor(cfg, b))
+		}
+	}
+	if err != nil {
+		lg.Writef("FAILED: %v", err)
+	} else {
+		lg.Writef("built; it starts when the move switches over")
+	}
+	d.finish(id, err)
+	return id, err
+}
+
+// buildCommit returns the build of j.sha: a kept one, or a new one made
+// from the source (fresh=true). The app keeps running meanwhile.
+func (d *Deployer) buildCommit(ctx context.Context, cfg AppConfig, j job, lg *logs.Log) (b Build, fresh bool, err error) {
 	name, id := cfg.Base.Name, BuildID(j.sha)
 
 	// A build still kept on the server needs no rebuild, unless its files
@@ -442,34 +508,34 @@ func (d *Deployer) deploy(ctx context.Context, cfg AppConfig, j job, lg *logs.Lo
 	if kept, err := d.build(ctx, name, id); err == nil && kept.GitSHA == j.sha {
 		if d.buildIntact(kept) {
 			lg.Writef("commit %s is already built and kept on this server; switching to it (no rebuild)", kept.Short())
-			return d.activate(ctx, cfg, kept, j.id, lg)
+			return kept, false, nil
 		}
 		lg.Writef("the build of %s is recorded but its files are missing; building it again", kept.Short())
 		d.removeBuild(name, id, lg)
 	}
 	if d.Builder == nil {
-		return errors.New("builds are not available on this server")
+		return b, false, errors.New("builds are not available on this server")
 	}
 
 	// 1. The commit and its source archive. The app keeps serving during
 	// steps 1-5.
 	api, err := d.github(ctx)
 	if err != nil {
-		return err
+		return b, false, err
 	}
 	commit, err := api.Commit(ctx, cfg.Repo, j.sha)
 	if err != nil {
-		return err
+		return b, false, err
 	}
 	lg.Writef("commit %s: %s (%s, %s)", commit.Short(), commit.Subject, commit.Author, commit.Date.UTC().Format(time.DateTime+" UTC"))
 
 	ws, err := d.Builder.Prepare(name, j.id)
 	if err != nil {
-		return err
+		return b, false, err
 	}
 	defer d.Builder.Remove(ws)
 	if err := api.Tarball(ctx, cfg.Repo, j.sha, ws.Archive, source.MaxArchive); err != nil {
-		return err
+		return b, false, err
 	}
 	if fi, err := os.Stat(ws.Archive); err == nil {
 		lg.Writef("downloaded the source archive (%.1f MB)", float64(fi.Size())/(1<<20))
@@ -477,12 +543,12 @@ func (d *Deployer) deploy(ctx context.Context, cfg AppConfig, j job, lg *logs.Lo
 
 	// 2. Unpack and read goboat.toml.
 	if err := source.Unpack(ws.Archive, ws.Src, source.SourceLimits); err != nil {
-		return fmt.Errorf("unpack the source: %w", err)
+		return b, false, fmt.Errorf("unpack the source: %w", err)
 	}
 	os.Remove(ws.Archive)
 	m, err := manifest.Load(ws.Src)
 	if err != nil {
-		return err
+		return b, false, err
 	}
 	lg.Writef("goboat.toml: package %s, args %q, health %s", m.Package, m.Args, m.HealthPath)
 
@@ -492,10 +558,10 @@ func (d *Deployer) deploy(ctx context.Context, cfg AppConfig, j job, lg *logs.Lo
 		d.setBuildStats(j.id, res)
 	}
 	if err != nil {
-		return err
+		return b, false, err
 	}
 	if err := source.CheckBinary(ws.Binary, runtime.GOARCH); err != nil {
-		return err
+		return b, false, err
 	}
 	lg.Writef("built with %s", res.GoVersion)
 
@@ -503,11 +569,11 @@ func (d *Deployer) deploy(ctx context.Context, cfg AppConfig, j job, lg *logs.Lo
 	dir := d.Layout.BuildDir(name, id)
 	os.RemoveAll(dir) // a stray directory from an interrupted deploy
 	if err := os.Mkdir(dir, 0o755); err != nil {
-		return fmt.Errorf("store build: %w", err)
+		return b, false, fmt.Errorf("store build: %w", err)
 	}
 	if err := os.Rename(ws.Src, d.Layout.BuildSrc(name, id)); err != nil {
 		os.RemoveAll(dir)
-		return fmt.Errorf("store build: %w", err)
+		return b, false, fmt.Errorf("store build: %w", err)
 	}
 	bin := d.Layout.BuildBinary(name, id)
 	err = os.Rename(ws.Binary, bin)
@@ -519,7 +585,7 @@ func (d *Deployer) deploy(ctx context.Context, cfg AppConfig, j job, lg *logs.Lo
 	}
 	if err != nil {
 		os.RemoveAll(dir)
-		return fmt.Errorf("store build: %w", err)
+		return b, false, fmt.Errorf("store build: %w", err)
 	}
 	var size int64
 	if fi, err := os.Stat(bin); err == nil {
@@ -529,20 +595,14 @@ func (d *Deployer) deploy(ctx context.Context, cfg AppConfig, j job, lg *logs.Lo
 	if branch == "" {
 		branch, _ = d.BranchOf(ctx, cfg)
 	}
-	b := Build{App: name, ID: id, GitSHA: j.sha, Branch: branch, Subject: commit.Subject, GoVersion: res.GoVersion,
+	b = Build{App: name, ID: id, GitSHA: j.sha, Branch: branch, Subject: commit.Subject, GoVersion: res.GoVersion,
 		Package: m.Package, Args: m.Args, HealthPath: m.HealthPath, Size: size, BuildTime: res.Took, CreatedAt: time.Now()}
 	if err := d.insertBuild(ctx, b); err != nil {
 		os.RemoveAll(dir)
-		return fmt.Errorf("record build: %w", err)
+		return b, false, fmt.Errorf("record build: %w", err)
 	}
 
-	// 5-9. Switch with health check; go back on failure.
-	if err := d.activate(ctx, cfg, b, j.id, lg); err != nil {
-		d.removeBuild(name, id, lg)
-		return err
-	}
-	d.pruneBuilds(name, lg)
-	return nil
+	return b, true, nil
 }
 
 func (d *Deployer) rollback(ctx context.Context, cfg AppConfig, j job, lg *logs.Log) error {

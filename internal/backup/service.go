@@ -118,6 +118,10 @@ type Service struct {
 	Box    *secrets.Box
 	Log    *slog.Logger
 	Hooks  Hooks
+	// Paused reports that no scheduled backup may run (a server move is
+	// switching, or this server was moved: it must not write to the
+	// bucket any more). nil = never.
+	Paused func() bool
 
 	mu      sync.Mutex // one backup/restore at a time
 	uploads sync.WaitGroup
@@ -191,6 +195,9 @@ func (s *Service) Init(ctx context.Context) error {
 // interrupted by a restart, failed uploads, and backups taken before a
 // bucket was configured.
 func (s *Service) UploadPending(ctx context.Context) {
+	if s.Paused != nil && s.Paused() {
+		return
+	}
 	if _, ok, err := s.S3Config(ctx); err != nil || !ok {
 		return
 	}
@@ -638,6 +645,14 @@ func (s *Service) pruneLocal(app string) {
 	s.forgetEmpty(app, time.Now().Add(-s.retention()))
 }
 
+// Quiesce waits for a backup or restore that is running to finish (call
+// after Paused turns true).
+func (s *Service) Quiesce() {
+	s.mu.Lock()
+	//lint:ignore SA2001 waiting for the running backup is the point
+	s.mu.Unlock()
+}
+
 // Wait blocks until background uploads finish (shutdown, tests).
 func (s *Service) Wait() { s.uploads.Wait() }
 
@@ -706,6 +721,9 @@ func (s *Service) Schedule(ctx context.Context) {
 
 // RunAll backs up every app (one at a time).
 func (s *Service) RunAll(ctx context.Context, kind string) {
+	if s.Paused != nil && s.Paused() {
+		return
+	}
 	for _, app := range s.Hooks.Apps() {
 		if ctx.Err() != nil {
 			return

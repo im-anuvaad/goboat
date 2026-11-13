@@ -78,10 +78,12 @@ The home page always lists what is still missing.
 The old server keeps serving until you press **Switch now**.
 
 1. Create the new VPS (same requirements as above).
-2. In the old dashboard: **Settings → Move to another server → Start**. It shows one command.
-3. Run that command on the new server over SSH. It installs goboat and copies the settings, apps, env vars and certificates from the old server. The new server then builds every app; the old dashboard shows the progress.
-4. When every app is built, press **Switch now** in the old dashboard. The old server stops its apps and hands over their latest data; the new server starts them and points the DNS records at itself. Typically under a minute of downtime.
-5. Sign in at your dashboard domain as usual (same account) and delete the old VPS.
+2. In the old dashboard: **Settings → Move to another server**, enter your password, **Create move code**. It shows one command (valid for an hour).
+3. Run that command on the new server over SSH. It installs the same goboat version and copies the settings, apps, env vars and certificates from the old server. The new server then builds every app and copies their data; the old dashboard shows the progress. Settings can't be changed meanwhile.
+4. When it says ready, press **Switch now** in the old dashboard. The old server stops its apps, the new one takes the files that changed and starts them, and DNS points at it. Measured: under 2 seconds of downtime for small apps.
+5. Sign in at your dashboard domain as usual (same account). The old server now only says it was moved; delete it after half an hour (it passes stray connections on until then).
+
+**Cancel** works until the switch is done; everything then stays on the old server. If the new server fails before the switch, it removes what it received.
 
 If the old server is already gone, install goboat on a new one, repeat the first steps and **Add app** for each app: the form offers the app's backup folder in the bucket and restores its newest backup before the first deploy.
 

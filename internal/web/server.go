@@ -27,6 +27,7 @@ import (
 	"github.com/im-anuvaad/goboat/internal/edge"
 	"github.com/im-anuvaad/goboat/internal/layout"
 	"github.com/im-anuvaad/goboat/internal/metrics"
+	"github.com/im-anuvaad/goboat/internal/move"
 	"github.com/im-anuvaad/goboat/internal/store"
 	"github.com/im-anuvaad/goboat/internal/supervisor"
 )
@@ -52,6 +53,7 @@ type Server struct {
 	Store      *store.Store
 	Backups    *backup.Service
 	Metrics    *metrics.Collector
+	Move       *move.Source // nil = moves not available
 	Thresholds Thresholds
 	Layout     layout.Layout
 	Version    string
@@ -115,6 +117,10 @@ func (s *Server) Handler() (http.Handler, error) {
 	authed("POST /settings/edge-sync", s.edgeSync)
 	authed("POST /settings/ssl-strict", s.sslStrict)
 	authed("POST /settings/revoke-cert", s.revokeCert)
+	authed("GET /settings/move", s.movePage)
+	authed("POST /settings/move/start", s.moveStart)
+	authed("POST /settings/move/cancel", s.moveCancel)
+	authed("POST /settings/move/switch", s.moveSwitch)
 	authed("GET /account", s.accountPage)
 	authed("POST /account/email", s.changeEmail)
 	authed("POST /account/password", s.changePassword)
@@ -122,7 +128,20 @@ func (s *Server) Handler() (http.Handler, error) {
 	authed("POST /account/api-token", s.rotateAPIToken)
 	authed("POST /account/api-token/revoke", s.revokeAPIToken)
 	s.apiRoutes(mux)
-	return s.secure(mux), nil
+	dash := s.secure(s.moveGuard(mux))
+	if s.Move == nil {
+		return dash, nil
+	}
+	moveAPI := s.Move.Handler()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The new server authenticates with the move code, not a session:
+		// no cookies, so no cross-origin checks either.
+		if strings.HasPrefix(r.URL.Path, "/move/v1/") {
+			moveAPI.ServeHTTP(w, r)
+			return
+		}
+		dash.ServeHTTP(w, r)
+	}), nil
 }
 
 func staticHandler(fsys fs.FS) http.Handler {

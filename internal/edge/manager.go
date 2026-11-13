@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/im-anuvaad/goboat/internal/cloudflare"
@@ -99,6 +100,14 @@ type Manager struct {
 	pubV4     string
 	pubV6     string
 	unused    []UnusedCert
+	paused    string // why Cloudflare syncs are off ("" = they run)
+	srv       *http.Server
+	noKeep    atomic.Bool // retired: no keep-alive connections
+	connMu    sync.Mutex
+	conns     map[net.Conn]http.ConnState
+	fwdAddrs  []string  // retired: pass connections on to these servers
+	fwdUntil  time.Time // ... until then
+	fwdPort   string    // "" = 443 (tests use another)
 	retry     int
 	retryT    *time.Timer
 }
@@ -450,7 +459,7 @@ func (m *Manager) Serve(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("edge: listen %s: %w", m.cfg.Listen, err)
 	}
-	fl := m.Filter.Listen(ln, m.log, m.SetupOpen)
+	fl := m.forwarding(m.Filter.Listen(ln, m.log, m.SetupOpen))
 	m.Router.SetupOpen = m.SetupOpen
 	m.Router.DashboardReached = m.DashboardReached
 	m.Router.SetDashboardHost(m.DashboardHost())
@@ -462,7 +471,14 @@ func (m *Manager) Serve(ctx context.Context) error {
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    64 << 10,
 		ErrorLog:          stdlog.New(&serverErrors{log: m.log}, "", 0),
+		ConnState:         m.connState,
 	}
+	m.mu.Lock()
+	m.srv = srv
+	if m.noKeep.Load() {
+		srv.SetKeepAlivesEnabled(false)
+	}
+	m.mu.Unlock()
 	go func() {
 		<-ctx.Done()
 		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -594,10 +610,174 @@ func missingPermissions(ctx context.Context, c *cloudflare.Client, z cloudflare.
 	return missing
 }
 
+// Pause turns Cloudflare syncs off (no DNS, certificate or cleanup calls)
+// until Resume: while a server move hands over (docs/architecture.md §10),
+// and for good on a server that was moved.
+func (m *Manager) Pause(why string) {
+	m.mu.Lock()
+	m.paused = why
+	m.mu.Unlock()
+}
+
+// PauseAndWait pauses syncs and waits for a sync that is running to end,
+// so nothing changes at Cloudflare after it returns.
+func (m *Manager) PauseAndWait(why string) {
+	m.Pause(why)
+	m.syncMu.Lock()
+	//lint:ignore SA2001 waiting for a running sync is the point; Sync checks the pause again under syncMu
+	m.syncMu.Unlock()
+}
+
+// ForwardTo makes a retired server pass every new connection from
+// Cloudflare, as raw TCP, to the server that replaced it (addrs, tried in
+// order) until the time is up. Cloudflare's edge picks a DNS change up
+// over a minute or two; meanwhile its connections to this server end up
+// there instead of at a "moved" page. TLS stays between Cloudflare and the
+// new server.
+func (m *Manager) ForwardTo(addrs []string, until time.Time) {
+	m.mu.Lock()
+	m.fwdAddrs, m.fwdUntil = addrs, until
+	m.mu.Unlock()
+	if len(addrs) > 0 && time.Now().Before(until) {
+		m.log.Info("passing connections on to the new server", "to", addrs, "until", until.UTC().Format(time.TimeOnly))
+	}
+}
+
+// PublicAddrs returns this server's public addresses (detecting them if
+// no sync did yet).
+func (m *Manager) PublicAddrs(ctx context.Context) []string {
+	v4, v6, err := m.publicIPs(ctx)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, a := range []string{v4, v6} {
+		if a != "" {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+type forwardListener struct {
+	net.Listener
+	m *Manager
+}
+
+func (m *Manager) forwarding(ln net.Listener) net.Listener {
+	return &forwardListener{Listener: ln, m: m}
+}
+
+func (l *forwardListener) Accept() (net.Conn, error) {
+	for {
+		c, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		l.m.mu.RLock()
+		addrs, until, port := l.m.fwdAddrs, l.m.fwdUntil, l.m.fwdPort
+		l.m.mu.RUnlock()
+		if _, setup := c.(*setupConn); setup || len(addrs) == 0 || time.Now().After(until) {
+			return c, nil
+		}
+		if port == "" {
+			port = "443"
+		}
+		go forward(c, addrs, port, l.m.log)
+	}
+}
+
+func forward(c net.Conn, addrs []string, port string, log *slog.Logger) {
+	defer c.Close()
+	var up net.Conn
+	var err error
+	for _, a := range addrs {
+		if up, err = net.DialTimeout("tcp", net.JoinHostPort(a, port), 5*time.Second); err == nil {
+			break
+		}
+	}
+	if up == nil {
+		log.Warn("passing a connection on to the new server failed", "err", err)
+		return
+	}
+	defer up.Close()
+	done := make(chan struct{}, 2)
+	cp := func(dst, src net.Conn) {
+		io.Copy(dst, src)
+		if tc, ok := dst.(*net.TCPConn); ok {
+			tc.CloseWrite()
+		}
+		done <- struct{}{}
+	}
+	go cp(up, c)
+	go cp(c, up)
+	<-done
+	<-done
+}
+
+// DropConnections closes idle keep-alive connections and keeps every later
+// one to a single request. Cloudflare reuses its connections to an origin
+// for minutes; a server that was moved must not keep answering on them
+// once DNS points elsewhere (docs/architecture.md §10).
+func (m *Manager) DropConnections() {
+	m.noKeep.Store(true)
+	m.mu.Lock()
+	if m.srv != nil {
+		m.srv.SetKeepAlivesEnabled(false)
+	}
+	m.mu.Unlock()
+	m.connMu.Lock()
+	defer m.connMu.Unlock()
+	for c, st := range m.conns {
+		if st == http.StateIdle || st == http.StateNew {
+			c.Close()
+		}
+	}
+}
+
+// connState tracks connections; once retired, every connection is closed
+// as soon as it is idle (HTTP/2 included, which keeps one connection busy
+// for many requests).
+func (m *Manager) connState(c net.Conn, st http.ConnState) {
+	m.connMu.Lock()
+	defer m.connMu.Unlock()
+	if m.conns == nil {
+		m.conns = map[net.Conn]http.ConnState{}
+	}
+	switch st {
+	case http.StateClosed, http.StateHijacked:
+		delete(m.conns, c)
+		return
+	}
+	m.conns[c] = st
+	if st == http.StateIdle && m.noKeep.Load() {
+		c.Close()
+	}
+}
+
+// Resume turns Cloudflare syncs back on.
+func (m *Manager) Resume() {
+	m.mu.Lock()
+	m.paused = ""
+	m.mu.Unlock()
+}
+
 // Sync reconciles DNS records, certificates, AOP and SSL mode checks.
 func (m *Manager) Sync(ctx context.Context) (Status, error) {
+	m.mu.RLock()
+	paused := m.paused
+	m.mu.RUnlock()
+	if paused != "" {
+		return m.Status(ctx), errors.New("Cloudflare sync is paused: " + paused)
+	}
 	m.syncMu.Lock()
 	defer m.syncMu.Unlock()
+	m.mu.RLock()
+	paused = m.paused
+	m.mu.RUnlock()
+	if paused != "" { // paused while this sync waited for the previous one
+		return Status{}, errors.New("Cloudflare sync is paused: " + paused)
+	}
 	err := m.sync(ctx)
 	m.mu.Lock()
 	m.lastSync = time.Now()
@@ -750,6 +930,21 @@ func (m *Manager) syncHost(ctx context.Context, c *cloudflare.Client, h hostEntr
 			return fmt.Errorf("DNS: %w", err)
 		}
 		dns = append(dns, "AAAA "+v6+" ("+res+")")
+	} else {
+		// No IPv6 here: an AAAA record (e.g. of the server this one
+		// replaced) would send part of the visitors elsewhere.
+		rs, err := c.DNSRecords(ctx, z.ID, h.Host)
+		if err != nil {
+			return fmt.Errorf("DNS: %w", err)
+		}
+		for _, r := range rs {
+			if r.Type == "AAAA" {
+				if err := c.DeleteDNSRecord(ctx, z.ID, r.ID); err != nil && !cloudflare.IsNotFound(err) {
+					return fmt.Errorf("DNS: %w", err)
+				}
+				dns = append(dns, "AAAA "+r.Content+" (deleted: this server has no IPv6)")
+			}
+		}
 	}
 	hs.DNS = strings.Join(dns, ", ")
 
