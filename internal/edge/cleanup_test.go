@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/im-anuvaad/goboat/internal/cloudflare"
 	"github.com/im-anuvaad/goboat/internal/secrets"
 	"github.com/im-anuvaad/goboat/internal/store"
 )
@@ -444,4 +445,22 @@ func TestForwardListener(t *testing.T) {
 	if string(b) != "new:hello" {
 		t.Fatalf("got %q", b)
 	}
+}
+
+// IPv6 that is configured but not detected (just after boot) must not
+// delete AAAA records; a server without IPv6 deletes them.
+func TestAAAAOnlyDeletedWithoutIPv6(t *testing.T) {
+	te := newTestEdge(t)
+	te.f.mu.Lock()
+	te.f.dns["v6"] = fakeRecord{Type: "AAAA", Name: "blog.example.test", Content: "2001:db8::1"}
+	te.f.mu.Unlock()
+	te.m.pubV6, te.m.v6Unknown = "", true
+	te.known = []string{"blog.example.test"}
+	te.m.SetRoutes([]Route{{Host: "blog.example.test", App: "app0", Port: 20001}})
+	// publicIPs would detect again; pin the state the detection left.
+	te.m.syncHost(context.Background(), te.m.client("tok"), hostEntry{Host: "blog.example.test"}, "192.0.2.1", "", &HostStatus{}, map[string]cloudflare.Zone{})
+	want(t, te.f, "A blog.example.test;AAAA blog.example.test", "blog.example.test", 0)
+	te.m.v6Unknown = false
+	te.m.syncHost(context.Background(), te.m.client("tok"), hostEntry{Host: "blog.example.test"}, "192.0.2.1", "", &HostStatus{}, map[string]cloudflare.Zone{})
+	want(t, te.f, "A blog.example.test", "blog.example.test", 0)
 }
