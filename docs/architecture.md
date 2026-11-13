@@ -1,6 +1,6 @@
 # goboat Architecture
 
-Reference for whoever maintains goboat. The rules for hosted apps are in [app-contract.md](app-contract.md); installing and using it is in the [README](../README.md).
+Reference for whoever maintains goboat. The rules for hosted apps are in [app-contract.md](app-contract.md); installing, using and running goboat is in [deployment.md](deployment.md); the overview is the [README](../README.md).
 
 ## 1. What and why
 
@@ -289,7 +289,7 @@ The old server serves `/move/v1/*` on its dashboard domain, through Cloudflare (
 - **Failure before the switch** (build error, wrong version, cancel): the new server tells the old one (`POST failed`), which unfreezes; the new server removes everything it received (database, `master.key`, `aop/`, `certs/`, apps and their users) and goboat restarts empty. Re-running the install command retries.
 - **Failure after the switch:** the old server restarts its apps only when told so (`POST failed`, or **Cancel**). The new server deletes nothing unless the old server confirmed; otherwise it keeps everything and goboat restarts and continues the move. A lost answer to `done` is checked by asking the old server. (An earlier version deleted what it had received when the answer to `done` was cut off, leaving neither server with the apps; found in testing and fixed before release.)
 - **goboat restarting on the old server mid-move** ends the move as failed; the apps start there as usual.
-- **Moved mode** (old server, persists across restarts, reboots and re-installs): no apps, no backups, no Cloudflare syncs or cleanup; every dashboard page says where the installation went and that the server can be deleted. Nothing on it writes to the bucket or Cloudflare any more, so the two servers never compete.
+- **Moved mode** (old server, persists across restarts, reboots and re-installs): no apps, no backups, no Cloudflare syncs or cleanup; every dashboard page says where the installation went and that the server can be deleted (the status API answers `410` with the same message). Nothing on it writes to the bucket or Cloudflare any more, so the two servers never compete.
 - Moved: everything in each app's `DATA_DIR`, not only its databases (symlinks and special files are skipped). Not moved: logs, metrics, deploy history of builds (the builds of the current commits are new), local backup copies (the bucket copies stay usable).
 - Builds are redone on the new server, so it may have a different CPU architecture.
 

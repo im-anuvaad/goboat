@@ -14,7 +14,7 @@ import (
 // (docs/app-contract.md).
 const ContractVersion = 1
 
-// Default resource limits (docs/app-contract.md §9).
+// Default resource limits (docs/app-contract.md §12).
 const (
 	DefaultMemoryMax  = 256 << 20
 	DefaultCPUMax     = 1.0

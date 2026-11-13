@@ -23,6 +23,10 @@ func (s *Server) moveGuard(next http.Handler) http.Handler {
 			return
 		}
 		if m, ok := s.Move.MovedTo(r.Context()); ok {
+			if strings.HasPrefix(r.URL.Path, "/api/") {
+				apiError(w, http.StatusGone, fmt.Sprintf("this server was moved to %s on %s; ask the dashboard domain again (it now reaches the new server)", m.IP, m.At.UTC().Format(time.RFC3339)))
+				return
+			}
 			s.render(w, r, http.StatusGone, "notice", "Moved", "", map[string]any{
 				"Heading": "This server was moved",
 				"Message": fmt.Sprintf("Its apps, settings and data were moved to the server %s on %s. It no longer serves anything, takes no backups and changes nothing at Cloudflare. You can delete it.", m.IP, m.At.Local().Format("2 January 2006 15:04 MST")),

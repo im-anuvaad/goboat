@@ -1,133 +1,106 @@
-<p align="center"><img src="docs/assets/logo.svg" alt="goboat logo" width="96" height="96"></p>
+<p align="center">
+  <img src="docs/assets/goboat-logo-light.svg" alt="goboat" width="340">
+</p>
 
-<h1 align="center">goboat</h1>
+<p align="center"><b>Push Go + SQLite apps to your own server. goboat builds, runs and backs them up.</b></p>
 
-<p align="center"><a href="docs/app-contract.md">App contract</a> · <a href="docs/architecture.md">Architecture</a> · <a href="docs/api.md">Status API</a> · <a href="https://github.com/im-anuvaad/goboat/releases/latest">Latest release</a></p>
+<p align="center">
+  <a href="https://github.com/im-anuvaad/goboat/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/im-anuvaad/goboat?color=1B2438"></a>
+  <a href="LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/license-Apache%202.0-1B2438"></a>
+  <img alt="Ubuntu 24.04+" src="https://img.shields.io/badge/server-Ubuntu%2024.04%2B-1B2438">
+  <a href="https://x.com/im_anuvaad"><img alt="Follow @im_anuvaad on X" src="https://img.shields.io/badge/follow-%40im__anuvaad-1B2438?logo=x"></a>
+</p>
 
-A small, self-contained PaaS for **Go + SQLite** web apps on a single VPS behind Cloudflare.
+<p align="center">
+  <a href="docs/deployment.md"><b>Deploy goboat</b></a> ·
+  <a href="docs/app-contract.md"><b>Write an app</b></a> ·
+  <a href="docs/api.md">Status API</a> ·
+  <a href="docs/architecture.md">Architecture</a>
+</p>
 
-Connect a GitHub repository, pick a branch and a domain, press **Deploy**: goboat downloads the code, builds it on the server and runs it. No release workflow, no Docker, no extra reverse proxy. SSH in once and run one command; everything else happens in a web dashboard.
+---
+
+## About
+
+goboat is a small, self-hosted platform for **Go web apps that keep their data in SQLite**. It runs on one Ubuntu server behind Cloudflare, as a single binary with a web dashboard.
+
+Connect a GitHub repository, pick a branch and a domain, press **Deploy**. goboat downloads that commit, builds it with Go on the server, runs it as its own Linux user with its own memory and CPU limits, gives it a certificate and DNS record in Cloudflare, and backs its databases up every 10 minutes. No Docker, no release pipelines, no reverse proxy to configure: one SSH command to install, the dashboard for everything else.
 
 ```
-Cloudflare (proxied, Full strict) ──HTTPS──► goboat ──► your Go apps on 127.0.0.1
-                                             TLS, routing, builds, dashboard,
-                                             deploys, backups
+Cloudflare ──HTTPS (Full strict, origin pulls)──► goboat ──► your Go apps on 127.0.0.1
+                                                  builds · deploys · TLS · backups · logs
 ```
-
-- **Deploy a branch with a click.** The app page lists the newest commits of the app's branch; **Deploy** builds the one you pick with the Go toolchain on the server and swaps it in. The previous builds are kept, so rollback is one click and needs no rebuild.
-- **Only your Cloudflare account can reach your apps**: Cloudflare Origin CA certificates (Full strict), a Cloudflare-only IP filter and Authenticated Origin Pulls with goboat's own certificate. goboat removes every certificate and DNS record it no longer uses.
-- **Light isolation**: each app runs as its own Linux user with a memory and CPU limit you pick from a list when you add it, and can change later.
-- **SQLite backups to R2 or any S3-compatible bucket** every 10 minutes (skipped when nothing changed) and before every deploy, kept for 48 hours, with one-click restore.
-- **Move to another server** from the dashboard: one command on the new server, one click to switch, typically under a minute of downtime.
-- **Monitoring and logs**: CPU, memory, requests and response times per app, live logs, build and deploy logs.
-- **Read-only status API** for scripts and AI agents ("is my blog up?"): [docs/api.md](docs/api.md).
-
-Scope: 1 server (Ubuntu 24.04+), 1 user, a few Go apps, all domains on Cloudflare. Status: **v0.1.0**.
 
 ![The goboat dashboard: an app's status, the Deploy menu with the newest commits of its branch, and CPU and memory charts](docs/assets/dashboard.png)
 
-## What machine you need
+## What you get
 
-Building Go code takes memory, so goboat is sized honestly:
-
-| Machine | What fits |
+| | |
 |---|---|
-| **2 vCPU, 2 GB RAM, 25 GB disk (recommended)** | goboat plus **1–2 production apps**, or **3–4 small apps** if you know they stay small (around 128–256 MB each) |
-| Less than 2 GB RAM | Not supported: builds of real apps would be slow or fail |
+| 🚀 **Deploy a commit with a click** | Builds on the server while the old version keeps serving; the switch takes about 0.2 s. The last 3 builds are kept for one-click rollback. |
+| 🔒 **Locked to your Cloudflare** | Origin CA certificates, a Cloudflare-only IP filter and Authenticated Origin Pulls. Every certificate and DNS record goboat stops using is cleaned up. |
+| 💾 **SQLite backups** | Every 10 minutes when something changed, and before every deploy, to R2 or any S3-compatible bucket. 48 hours kept, one-click restore. |
+| 🧳 **Move servers in two steps** | One command on the new server, **Switch now** on the old one. Measured: under 2 seconds of downtime. |
+| 📊 **Logs and monitoring** | Live logs, build logs, CPU, memory, requests and response times per app; a read-only JSON API for scripts and AI agents. |
 
-The installer adds a **2 GB swap file** (unless the server already has that much). Builds may use it; apps never swap, so a build can slow down but cannot push your running apps out of memory. The Go toolchain (about 250 MB) and the module and build caches (a few GB over time) live on the server.
+## Is goboat for you?
 
-## Before you start
+**A good fit if** you are one person running a few Go + SQLite apps (side projects, internal tools, small products) and you want them on your own VPS without doing ops.
 
-- A fresh Ubuntu 24.04+ VPS (x86_64 or arm64) with SSH access, ports 22 and 443 open.
-- Your domains on your Cloudflare account. For each zone, turn on **SSL/TLS → Edge Certificates → Always Use HTTPS** (goboat has no port 80).
-- A Cloudflare API token (**My Profile → API Tokens → Create Custom Token**) for your zones with:
+**Not a fit if** you need any of the [limitations](#known-limitations) below to be otherwise: several servers, high availability, other languages, other databases, or deploys without a human pressing the button.
 
-| Permission | Used for |
-|---|---|
-| Zone → Zone → Read | finding the zone of each domain |
-| Zone → DNS → Edit | proxied DNS records |
-| Zone → SSL and Certificates → Edit | Origin CA certificates, the origin pull certificate |
-| Zone → Zone Settings → Edit | turning on Authenticated Origin Pulls, reading and setting the SSL/TLS mode |
+## Known limitations
 
-- A GitHub fine-grained token with *Contents: Read-only* on your app repositories (required for private repositories; recommended for public ones because unauthenticated GitHub API calls are rate limited).
-- An R2 bucket with an R2 API token (*Object Read & Write* on that bucket), or any other S3-compatible bucket, for backups.
+- **One server, one account.** No clustering, failover or teams with separate logins.
+- **Go only, no cgo.** Apps build with `CGO_ENABLED=0`; use `modernc.org/sqlite`, not `mattn/go-sqlite3`.
+- **Only `go build` runs.** No `go generate`, npm, Tailwind or templ CLI on the server: commit generated files. Private Go modules must be vendored; no git submodules.
+- **Cloudflare is required.** Every domain must be proxied in your Cloudflare account, in Full (strict) mode. HTTPS only, no port 80, no raw TCP/UDP services.
+- **Short downtime per deploy.** The old version stops before the new one starts (safe for SQLite): about 0.2 s plus your app's startup. No blue-green, no deploy on push.
+- **Backups cover SQLite only**, at most 10 minutes old, kept 48 hours. Uploaded files in the data folder survive deploys and server moves but aren't backed up.
+- **Sized for small servers.** 2 vCPU / 2 GB RAM runs goboat plus 1–2 production apps, or 3–4 small ones. Per app: up to 1 GB of memory, 2 cores, one process; at most 20 apps.
+- **Trusted apps.** Apps are separated by Linux users and cgroups, not containers.
+- **Ubuntu 24.04+** with systemd and cgroup v2, x86_64 or arm64.
 
-## Install
+## Quick start
+
+On a fresh Ubuntu 24.04+ server with 2 GB of RAM and ports 22 and 443 open:
 
 ```bash
 curl -fsSL https://github.com/im-anuvaad/goboat/releases/latest/download/install.sh | sudo bash
 ```
 
-It asks nothing and takes about a minute: it installs goboat, the Go toolchain and the swap file, then ends with the address to open (`https://<server IP>`) and a **one-time password**. You can close SSH now.
+Open the address it prints, sign in with the one-time password, and follow the dashboard. You'll need a Cloudflare API token, a GitHub token and, for backups, a bucket: **[docs/deployment.md](docs/deployment.md)** has every step, plus updating, moving servers and troubleshooting.
 
-## First steps in the browser
+Your app needs a `goboat.toml` and a few conventions (port, data folder, migrations, shutdown): **[docs/app-contract.md](docs/app-contract.md)**. It is written so you can hand it to an AI agent as the brief for a goboat app.
 
-1. Open the address, accept the certificate warning (expected on this first visit), and sign in with the **one-time password**, leaving the email empty.
-2. **Set up your account**: your email and a password (at least 12 characters).
-3. **Settings → Cloudflare**: paste the API token. goboat checks it and lists the zones it can use and any missing permission.
-4. **Settings → Dashboard domain**: e.g. `goboat.example.com`. goboat creates the DNS record, the certificate and the origin pull setup and shows the progress; the first time for a zone this takes about 10 minutes. If the zone's SSL/TLS mode isn't Full (strict), press **Set Full (strict)** under **Zones**. Then open `https://goboat.example.com` and sign in; from then on the IP address no longer answers.
-5. **Settings → GitHub** and **Settings → Backups** (for R2: endpoint `https://<account id>.r2.cloudflarestorage.com`, region `auto`, bucket, keys).
-6. **Your app repo** follows [docs/app-contract.md](docs/app-contract.md): a Go `main` package and a `goboat.toml` at the root.
-7. **Apps → Add app**: pick the repository, then its **branch**, a **domain** (e.g. `blog.example.com`) and the **memory and CPU** for the app. Add env vars if needed, press **Deploy** on the newest commit and watch the build and deploy log.
+## Documentation
 
-The home page always lists what is still missing.
-
-## Day to day
-
-- **Deploy**: push to the app's branch, open the app page, press **Deploy**. goboat never deploys by itself.
-- **Change the branch, domain or limits**: the app page's **Settings**. A new branch applies on the next deploy, a new domain at once, new limits on the next restart (the page says so).
-- **Rollback**: pick one of the last 3 builds under **Rollback**.
-
-## Moving to a new server
-
-The old server keeps serving until you press **Switch now**.
-
-1. Create the new VPS (same requirements as above).
-2. In the old dashboard: **Settings → Move to another server**, enter your password, **Create move code**. It shows one command (valid for an hour).
-3. Run that command on the new server over SSH. It installs the same goboat version and copies the settings, apps, env vars and certificates from the old server. The new server then builds every app and copies their data; the old dashboard shows the progress. Settings can't be changed meanwhile.
-4. When it says ready, press **Switch now** in the old dashboard. The old server stops its apps, the new one takes the files that changed and starts them, and DNS points at it. Measured: under 2 seconds of downtime for small apps.
-5. Sign in at your dashboard domain as usual (same account). The old server now only says it was moved; delete it after half an hour (it passes stray connections on until then).
-
-**Cancel** works until the switch is done; everything then stays on the old server. If the new server fails before the switch, it removes what it received.
-
-If the old server is already gone, install goboat on a new one, repeat the first steps and **Add app** for each app: the form offers the app's backup folder in the bucket and restores its newest backup before the first deploy.
-
-## Updating, and when you are locked out
-
-Run the install command again. It installs the latest goboat and Go toolchain, keeps all apps and settings, restarts them (a few seconds of downtime) and prints a new one-time password. Use that password only if you need it, e.g. after forgetting your password or when the dashboard domain stops working: for 24 hours the server's IP address accepts it.
-
-## Troubleshooting
-
-| Symptom | Likely cause |
+| Document | For |
 |---|---|
-| `no Cloudflare zone found for …` when saving a domain | The domain isn't on this Cloudflare account, is misspelled, or the token doesn't cover that zone |
-| `… lacks the … permission` | Add the missing permission to the token, then **Sync now** in Settings |
-| Build fails with `goboat.toml` errors | The file is missing at the repository root or has an unknown key; see [docs/app-contract.md](docs/app-contract.md) |
-| Build fails with "the build ran out of memory", or builds are very slow | The build needed more than its 1.4–1.5 GB plus swap (the deploy log shows its peak memory and swap). Stop an app you don't need while building, or use a bigger server |
-| Build fails on a private module dependency | Not supported: only the app's own repository is fetched with the GitHub token; other modules must be public or vendored (`go mod vendor`) |
-| Dashboard domain stays "being set up" | The page says what it waits for: Cloudflare rolling out the origin pull certificate (about 10 minutes the first time), a zone in Flexible mode (**Set Full (strict)**), or a token without Zone Settings permission |
-| Cloudflare error 521 | The SSL/TLS mode is Flexible or Off: **Settings → Zones → Set Full (strict)**. A Page Rule or Configuration Rule can also set Flexible for one hostname; remove it |
-| Cloudflare error 526 | Full (strict) but the certificate isn't installed yet: **Sync now** in Settings |
-| Cloudflare error 525 / 520 | Origin pulls were changed in Cloudflare; goboat repairs them on the next sync (**Sync now**) and waits a few minutes before requiring them again |
-| **Settings → Cloudflare** shows "cleanup pending" | goboat could not delete a certificate or DNS record it no longer uses (the error is shown). It retries on every sync |
-| `has a CNAME record` | Delete the CNAME in Cloudflare; goboat creates the A record |
-| Nothing answers at all | Re-run the install command and use the address and one-time password it prints |
-| Install stops with `port 443 is already in use by …` | Another web server holds port 443; goboat serves HTTPS itself. Stop and disable it, then run the install command again |
+| [deployment.md](docs/deployment.md) | Installing, using, updating, moving and troubleshooting a goboat server |
+| [app-contract.md](docs/app-contract.md) | Writing a Go + SQLite app for goboat (people and agents) |
+| [api.md](docs/api.md) | The read-only status API |
+| [architecture.md](docs/architecture.md) | How goboat works inside (maintainers) |
 
-## License and maintenance
+## Built with goboat
 
-goboat is licensed under the [Apache License 2.0](LICENSE). It is built for our own use first: changes stay within the scope above (one server, one user, a few Go apps behind Cloudflare).
+<img src="docs/assets/goboat-badge-light.svg" alt="Built with goboat" width="180">
+
+Hosting your app on goboat? Show it: `docs/assets/goboat-badge-light.svg`.
 
 ## Development
 
 Requires Go (version in `go.mod`).
 
 ```bash
-make build       # dist/goboat for this machine
-make build-all   # static linux amd64 + arm64 binaries + checksums.txt
-make lint        # gofmt, go vet, staticcheck
-make test        # go test -race ./...
+make build      # dist/goboat for this machine
+make build-all  # static linux amd64 + arm64 binaries + checksums.txt
+make lint       # gofmt, go vet, staticcheck
+make test       # go test -race ./...
 ```
 
-goboat itself is released as prebuilt binaries: push a `vX.Y.Z` tag. How goboat works inside, and how to check a change on a real server before releasing it: [docs/architecture.md](docs/architecture.md).
+Releases are built by GitHub Actions from a `vX.Y.Z` tag. How to check a change on a real server first: [architecture.md §13](docs/architecture.md#13-changing-goboat).
+
+## License
+
+[Apache License 2.0](LICENSE) · © 2026 Sumit Yadav · [@im_anuvaad on X](https://x.com/im_anuvaad)
