@@ -99,6 +99,7 @@ type Manager struct {
 	lastIPs   time.Time
 	pubV4     string
 	pubV6     string
+	v6Unknown bool // the server has a global IPv6 address but detecting the public one failed
 	unused    []UnusedCert
 	paused    string // why Cloudflare syncs are off ("" = they run)
 	srv       *http.Server
@@ -643,6 +644,12 @@ func (m *Manager) ForwardTo(addrs []string, until time.Time) {
 	}
 }
 
+func (m *Manager) ipv6Unknown() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.v6Unknown
+}
+
 // PublicAddrs returns this server's public addresses (detecting them if
 // no sync did yet).
 func (m *Manager) PublicAddrs(ctx context.Context) []string {
@@ -903,6 +910,12 @@ func (m *Manager) sync(ctx context.Context) error {
 			errs = append(errs, err)
 		}
 	}
+	if m.ipv6Unknown() {
+		m.mu.Lock()
+		m.pubV6 = "" // detect again on the next (early) sync
+		m.mu.Unlock()
+		errs = append(errs, errors.New("the public IPv6 address could not be detected; AAAA records were left as they are"))
+	}
 	return errors.Join(errs...)
 }
 
@@ -930,6 +943,8 @@ func (m *Manager) syncHost(ctx context.Context, c *cloudflare.Client, h hostEntr
 			return fmt.Errorf("DNS: %w", err)
 		}
 		dns = append(dns, "AAAA "+v6+" ("+res+")")
+	} else if m.ipv6Unknown() {
+		dns = append(dns, "AAAA unchanged (IPv6 address not detected this time)")
 	} else {
 		// No IPv6 here: an AAAA record (e.g. of the server this one
 		// replaced) would send part of the visitors elsewhere.
@@ -1251,19 +1266,42 @@ func (m *Manager) publicIPs(ctx context.Context) (string, string, error) {
 		}
 		v4 = ip
 	}
+	unknown := false
 	if v6 == "" {
-		v6 = "off" // no IPv6: no AAAA records
 		if ip, err := DetectIP(ctx, "tcp6"); err == nil {
 			v6 = ip
+		} else if HasGlobalIPv6() {
+			// IPv6 is configured but didn't work this time (e.g. right
+			// after boot): not "no IPv6". AAAA records are left alone and
+			// the next sync tries again.
+			unknown = true
+			m.log.Warn("detecting the public IPv6 address failed; AAAA records are left as they are", "err", err)
+		} else {
+			v6 = "off" // no IPv6 on this server: no AAAA records
 		}
 	}
 	m.mu.Lock()
-	m.pubV4, m.pubV6 = v4, v6
+	m.pubV4, m.pubV6, m.v6Unknown = v4, v6, unknown
 	m.mu.Unlock()
 	if v6 == "off" {
 		v6 = ""
 	}
 	return v4, v6, nil
+}
+
+// HasGlobalIPv6 reports whether an interface has a global unicast IPv6
+// address.
+func HasGlobalIPv6() bool {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return true // can't tell: assume it has
+	}
+	for _, a := range addrs {
+		if n, ok := a.(*net.IPNet); ok && n.IP.To4() == nil && n.IP.IsGlobalUnicast() && !n.IP.IsPrivate() {
+			return true
+		}
+	}
+	return false
 }
 
 // DetectIP asks Cloudflare's trace endpoint which address we come from.

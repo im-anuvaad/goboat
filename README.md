@@ -1,4 +1,8 @@
-# goboat
+<p align="center"><img src="docs/assets/logo.svg" alt="goboat logo" width="96" height="96"></p>
+
+<h1 align="center">goboat</h1>
+
+<p align="center"><a href="docs/app-contract.md">App contract</a> · <a href="docs/architecture.md">Architecture</a> · <a href="docs/api.md">Status API</a> · <a href="https://github.com/im-anuvaad/goboat/releases/latest">Latest release</a></p>
 
 A small, self-contained PaaS for **Go + SQLite** web apps on a single VPS behind Cloudflare.
 
@@ -18,7 +22,9 @@ Cloudflare (proxied, Full strict) ──HTTPS──► goboat ──► your Go 
 - **Monitoring and logs**: CPU, memory, requests and response times per app, live logs, build and deploy logs.
 - **Read-only status API** for scripts and AI agents ("is my blog up?"): [docs/api.md](docs/api.md).
 
-Scope: 1 server (Ubuntu 24.04+), 1 user, a few Go apps, all domains on Cloudflare.
+Scope: 1 server (Ubuntu 24.04+), 1 user, a few Go apps, all domains on Cloudflare. Status: **v0.1.0**.
+
+![The goboat dashboard: an app's status, the Deploy menu with the newest commits of its branch, and CPU and memory charts](docs/assets/dashboard.png)
 
 ## What machine you need
 

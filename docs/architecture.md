@@ -135,7 +135,7 @@ The IP filter only proves "some Cloudflare account"; zone-level AOP with goboat'
 `Host` (lowercased, port removed) → dashboard, an app's `httputil.ReverseProxy` to `127.0.0.1:<port>`, or 404; `Host` must equal the SNI or 421. The proxy replaces `X-Forwarded-For`/`X-Real-IP` with `CF-Connecting-IP`, sets `X-Forwarded-Proto: https` and `X-Forwarded-Host`, keeps `Host`, flushes immediately (`FlushInterval: -1`; SSE, long-poll, WebSockets work), dials with a 5 s timeout. Switching builds → 503 (`Retry-After: 3`), starting → 503, stopped/crashed/never deployed → 503, proxy error → 502; goboat pages carry `X-Goboat-Page` and `no-store`. Per-app counters (requests, status classes, latency histogram) feed monitoring.
 
 ### 5.5 Cloudflare token, DNS, domains
-Token permissions: Zone Read, DNS Edit, SSL and Certificates Edit, Zone Settings Edit; saving it verifies it, lists readable zones and names missing permissions. For each domain: zone by longest suffix (a domain in no zone is refused when saved), proxied `A` (+ `AAAA` if the server has IPv6) created or updated in place; conflicting CNAMEs or duplicates are reported, never touched. Edge sync is best effort per host. Public IPv4/IPv6 are detected via `https://www.cloudflare.com/cdn-cgi/trace`. The dashboard domain (needs the token, can't be an app's domain) is routed at once and set up in the background; sessions are per domain.
+Token permissions: Zone Read, DNS Edit, SSL and Certificates Edit, Zone Settings Edit; saving it verifies it, lists readable zones and names missing permissions. For each domain: zone by longest suffix (a domain in no zone is refused when saved), proxied `A` (+ `AAAA` if the server has IPv6) created or updated in place. An AAAA record is deleted only when the server has no global IPv6 address at all (e.g. after a move to a server without IPv6); when an IPv6 address is configured but detecting the public one fails (seen right after a reboot), AAAA records are left alone and the sync retries within a minute; conflicting CNAMEs or duplicates are reported, never touched. Edge sync is best effort per host. Public IPv4/IPv6 are detected via `https://www.cloudflare.com/cdn-cgi/trace`. The dashboard domain (needs the token, can't be an app's domain) is routed at once and set up in the background; sessions are per domain.
 
 **Every app has a domain** (D21): Add app refuses to create an app without one ("Enter the domain the app will be served on"). The app's Settings can change the domain but not clear it.
 
@@ -304,23 +304,26 @@ The old server serves `/move/v1/*` on its dashboard domain, through Cloudflare (
 - Times are stored and scheduled in UTC and shown in the server's timezone with its name.
 - **Status API** ([api.md](api.md)): `GET /api/v1/status`, `/apps`, `/apps/{name}`, JSON only. One token `gbt_` + 32 random bytes, created/rotated on the Account page with the current password, shown once, only its SHA-256 stored. `Authorization: Bearer` only; refused on setup connections. It never exposes env values or secrets.
 
-## 12. Budget (to be measured on a 2 vCPU / 2 GB VPS)
+## 12. Budget (measured on a 2 vCPU / 1.9 GB VPS, Ubuntu 24.04, two small apps, v0.1.0)
 
-| | Target |
-|---|---|
-| Idle RSS of goboat | < 30 MB (soft heap limit 12 MB, `GOGC=50`, memory returned every 2 min) |
-| Idle CPU | < 1 % |
-| Proxy overhead | < 1 ms p50 |
-| goboat binary | < 30 MB |
-| Rebuild of a small app after a one-line change (warm caches) | < 20 s (measured: 1.2 s build, 2.8 s deploy) |
-| First build of a small app (cold caches) | < 2 min (measured: 63 s with SQLite) |
-| Deploy downtime (switch only) | < 1 s plus the app's start |
-| Server move downtime (small databases) | < 1 min (measured: 1.3–1.6 s) |
-| Reboot to serving | seconds |
+| | Target | Measured |
+|---|---|---|
+| Idle RSS of goboat | < 30 MB (soft heap limit 12 MB, `GOGC=50`, memory returned every 2 min) | 26.7–27.0 MB after 5 h of uptime |
+| Idle CPU | < 1 % | 0.04 % of one core over 3 minutes |
+| Proxy overhead | < 1 ms p50 | not isolated: goboat's own p50 and p95 for a health check, app included, fall in the lowest histogram bucket (≤ 5 ms) |
+| goboat binary | < 30 MB | 19 MB |
+| Rebuild of a small app after a one-line change (warm caches) | < 20 s | 1.2 s build, 2.8 s deploy |
+| First build of a small app (cold caches) | < 2 min | 63 s with `modernc.org/sqlite` (peak 1.2 GB) |
+| Deploy downtime (switch only) | < 1 s plus the app's start | 200–250 ms |
+| Server move downtime (small databases) | < 1 min | 1.3–1.6 s of 503s seen through Cloudflare |
+| Reboot to serving | seconds | 23–24 s from the reboot command to a 200 through Cloudflare (systemd boot 8.6 s; goboat listening 6 s after kernel start) |
+
+Most of the RSS is the binary's own code pages, so every new dependency costs memory.
 
 ## 13. Changing goboat
 
 - `make lint` (gofmt, vet, staticcheck) and `make test` (`-race`) run in CI on every PR with amd64/arm64 builds. Unit tests cover the risky pure parts: secrets, store and migrations, the one-time password, `goboat.toml`, source archive unpacking, backup archives and change detection, the cleanup queue and reconciliation decisions, the move bundle and its encryption, app names, the health check, the setup address, the GitHub client, page rendering and the status API.
+- History: goboat was built in seven phases, each checked on two real VPSes and the Cloudflare zone `doot.run`; the measured figures in §7.3, §8, §10 and §12 come from those checks.
 - There is **no automated end-to-end suite**. Anything touching processes, cgroups, builds, deploys, backups, moves or the edge must be tried on a real Ubuntu VPS with a real Cloudflare zone: tag a pre-release (`vX.Y.Z-rc1`), install it with `GOBOAT_VERSION=vX.Y.Z-rc1` in front of `bash`, and go through the affected flows. Useful checks: install/update (toolchain, swap), setup address closes, build + deploy + rollback + a broken build + a build that runs out of memory, restart/stop leaves no processes, backup (changed and unchanged) + restore, app delete and recreate with the same domain leaves exactly one Origin CA cert and one AOP cert in the zone, a move between two servers, direct IP access refused, no 520/521 through Cloudflare.
 - Release: push a `vX.Y.Z` tag; the release workflow lints, tests, builds both binaries, writes `checksums.txt` and publishes them with `install.sh`. Tags with `-` are pre-releases.
 - A schema change is a new numbered migration. An older binary then refuses the database.
